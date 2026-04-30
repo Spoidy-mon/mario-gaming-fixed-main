@@ -124,8 +124,12 @@ export default function App() {
             if (!latest || latest.status !== "active" || latest.is_paused) {
               clearInterval(timers.current[pc.id]); delete timers.current[pc.id]; return;
             }
-            // Read from ref — always has the latest value after add/reduce
-            pcLocalTime.current[pc.id] = Math.max(0, (pcLocalTime.current[pc.id] || 0) - 1);
+            // Use server-anchored end time for accuracy; fall back to local decrement
+            if (latest.session_end_time && latest.session_end_time > Date.now()) {
+              pcLocalTime.current[pc.id] = Math.max(0, Math.round((latest.session_end_time - Date.now()) / 1000));
+            } else {
+              pcLocalTime.current[pc.id] = Math.max(0, (pcLocalTime.current[pc.id] || 0) - 1);
+            }
             const t = pcLocalTime.current[pc.id];
 
             if (t <= 0) {
@@ -176,7 +180,12 @@ export default function App() {
             if (!latest || latest.status !== "active" || latest.is_paused) {
               clearInterval(ps5Timers.current[ps5.id]); delete ps5Timers.current[ps5.id]; return;
             }
-            ps5LocalTime.current[ps5.id] = Math.max(0, (ps5LocalTime.current[ps5.id] || 0) - 1);
+            // Use server-anchored end time for accuracy; fall back to local decrement
+            if (latest.session_end_time && latest.session_end_time > Date.now()) {
+              ps5LocalTime.current[ps5.id] = Math.max(0, Math.round((latest.session_end_time - Date.now()) / 1000));
+            } else {
+              ps5LocalTime.current[ps5.id] = Math.max(0, (ps5LocalTime.current[ps5.id] || 0) - 1);
+            }
             const t = ps5LocalTime.current[ps5.id];
 
             if (t <= 0) {

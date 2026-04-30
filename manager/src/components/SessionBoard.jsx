@@ -236,12 +236,43 @@ function SessionCard({ session, type, settings, handlers }) {
     session.payment_status === "pending" &&
     !session.payment_cash && !session.payment_upi;
 
-  useEffect(() => { setLocalTime(session.time_remaining||0); }, [session.time_remaining]);
+  // Server-anchored sync: snap only on significant external change (add/reduce time)
+  const localTimeRef = React.useRef(session.time_remaining||0);
+  const intervalRef  = React.useRef(null);
+
   useEffect(() => {
-    if (session.status!=="active"||session.is_paused) return;
-    const iv = setInterval(()=>setLocalTime(t=>Math.max(0,t-1)),1000);
-    return ()=>clearInterval(iv);
-  },[session.status,session.is_paused,session.time_remaining]);
+    if (session.status !== "active") {
+      localTimeRef.current = session.time_remaining||0;
+      setLocalTime(session.time_remaining||0);
+      return;
+    }
+    if (session.session_end_time && session.session_end_time > Date.now()) {
+      const serverT = Math.max(0, Math.round((session.session_end_time - Date.now()) / 1000));
+      if (Math.abs(localTimeRef.current - serverT) > 8) {
+        localTimeRef.current = serverT;
+        setLocalTime(serverT);
+      }
+    } else if (Math.abs(localTimeRef.current - (session.time_remaining||0)) > 8) {
+      localTimeRef.current = session.time_remaining||0;
+      setLocalTime(session.time_remaining||0);
+    }
+  }, [session.time_remaining, session.session_end_time, session.status]);
+
+  useEffect(() => {
+    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    if (session.status !== "active" || session.is_paused) return;
+    intervalRef.current = setInterval(() => {
+      let next;
+      if (session.session_end_time && session.session_end_time > Date.now()) {
+        next = Math.max(0, Math.round((session.session_end_time - Date.now()) / 1000));
+      } else {
+        next = Math.max(0, localTimeRef.current - 1);
+      }
+      localTimeRef.current = next;
+      setLocalTime(next);
+    }, 1000);
+    return () => { if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
+  }, [session.status, session.is_paused, session.session_end_time]); // eslint-disable-line
 
   const paidInfo = session.payment_mode && session.payment_mode !== "pending"
     ? session.payment_mode === "split"

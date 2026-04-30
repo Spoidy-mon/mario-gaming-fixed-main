@@ -377,6 +377,12 @@ body {
   color: var(--green);
   line-height: 1;
   text-shadow: 0 0 20px var(--green-glow);
+  /* Prevent layout shift & GPU-backed smooth rendering */
+  will-change: contents;
+  contain: layout style;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 
 .timer-warning .timer-digits {
@@ -410,13 +416,18 @@ body {
   border-radius: 2px;
   overflow: hidden;
   margin: 8px 0 16px;
+  /* Prevent reflow flicker during render */
+  contain: layout style;
+  transform: translateZ(0);
 }
 
 .progress-fill {
   height: 100%;
   background: var(--green);
   border-radius: 2px;
-  transition: width 1s linear;
+  transition: width 1s linear, background 0.4s ease;
+  will-change: width;
+  transform: translateZ(0); /* GPU layer — prevents repaint flicker */
 }
 
 .progress-low { background: var(--yellow); }
@@ -4380,7 +4391,12 @@ body {
   gap: 4px;
 }
 
-.st-dataman-resets {}
+.st-dataman-resets {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
 .st-dataman-resets-title {
   font-size: 12px;
   font-weight: 800;

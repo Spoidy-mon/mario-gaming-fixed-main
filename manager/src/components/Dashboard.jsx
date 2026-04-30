@@ -452,7 +452,8 @@ function SessionCard({ dev, devType, settings, onStart, onQuickStart, onAddTime,
   const [modal,      setModal]      = useState(null);
   const [localTime,  setLocalTime]  = useState(dev.time_remaining);
   const [confirmShut,setConfirmShut]= useState(false);
-  const localTimeRef = React.useRef(dev.time_remaining);
+  const localTimeRef   = React.useRef(dev.time_remaining);
+  const intervalRef    = React.useRef(null);
 
   const statusCls = getStatusCls(dev);
   const isPS5     = devType === "ps5";
@@ -461,25 +462,61 @@ function SessionCard({ dev, devType, settings, onStart, onQuickStart, onAddTime,
   const icon      = isPS5 ? "🎮" : "🖥";
   const color     = isPS5 ? "ps5-card" : "";
 
-  // Sync from Firebase ONLY when the difference is more than 3s
-  // (i.e. an external add/reduce, not our own countdown drift)
+  // Sync from Firebase: use server-anchored end time when available for accuracy
+  // Only hard-reset local counter when an external change (add/reduce) happens (diff > 8s)
   useEffect(() => {
-    const diff = Math.abs(localTimeRef.current - dev.time_remaining);
-    if (diff > 3) {
+    if (dev.status !== "active") {
+      // Not active — always sync to FB value (0 or whatever)
       localTimeRef.current = dev.time_remaining;
       setLocalTime(dev.time_remaining);
+      return;
     }
-  }, [dev.time_remaining]);
+    // Use server-anchored end time for precise sync
+    if (dev.session_end_time && dev.session_end_time > Date.now()) {
+      const serverTime = Math.max(0, Math.round((dev.session_end_time - Date.now()) / 1000));
+      const diff = Math.abs(localTimeRef.current - serverTime);
+      // Only snap to server time on significant external change (add/reduce)
+      if (diff > 8) {
+        localTimeRef.current = serverTime;
+        setLocalTime(serverTime);
+      }
+    } else {
+      const diff = Math.abs(localTimeRef.current - dev.time_remaining);
+      if (diff > 8) {
+        localTimeRef.current = dev.time_remaining;
+        setLocalTime(dev.time_remaining);
+      }
+    }
+  }, [dev.time_remaining, dev.session_end_time, dev.status]);
 
-  // Countdown — only restarts when status/paused changes, NOT on time_remaining
+  // Single stable countdown interval — created once per active session, never duplicated
   useEffect(() => {
+    // Clear any existing interval first to prevent duplication
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
     if (dev.status !== "active" || dev.is_paused) return;
-    const iv = setInterval(() => {
-      localTimeRef.current = Math.max(0, localTimeRef.current - 1);
-      setLocalTime(localTimeRef.current);
+
+    intervalRef.current = setInterval(() => {
+      // Prefer server-anchored calculation to prevent drift
+      let next;
+      if (dev.session_end_time && dev.session_end_time > Date.now()) {
+        next = Math.max(0, Math.round((dev.session_end_time - Date.now()) / 1000));
+      } else {
+        next = Math.max(0, localTimeRef.current - 1);
+      }
+      localTimeRef.current = next;
+      setLocalTime(next);
     }, 1000);
-    return () => clearInterval(iv);
-  }, [dev.status, dev.is_paused]); // eslint-disable-line
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [dev.status, dev.is_paused, dev.session_end_time]); // eslint-disable-line
 
   const isLow  = dev.status==="active" && localTime<=300 && !dev.is_paused;
   const payPending = dev.payment_status === "pending" || dev.payment_status === "partial";
@@ -562,11 +599,11 @@ function SessionCard({ dev, devType, settings, onStart, onQuickStart, onAddTime,
           </div>
         )}
 
-        {/* Progress */}
-        {dev.status==="active"&&(
+        {/* Progress — completely hidden (zero height) when session not active */}
+        {dev.status==="active" && (
           <div className="progress-track">
             <div className={`progress-fill ${isLow?"progress-low":""}`}
-              style={{width:`${Math.min(100,(localTime/(dev.session_duration||3600))*100)}%`}} />
+              style={{width:`${Math.min(100,Math.max(0,(localTime/Math.max(1,dev.session_duration||3600))*100))}%`}} />
           </div>
         )}
 

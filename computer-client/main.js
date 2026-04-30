@@ -336,9 +336,15 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
     if (tickInterval) return; // already running — do not create another
     tickInterval = setInterval(() => {
       if (!paused) {
-        // Use server-anchored end time if available for accuracy
-        if (serverEndTime > 0) {
-          t = Math.max(0, Math.round((serverEndTime - Date.now()) / 1000));
+        // Prefer server-anchored end time for drift-free accuracy
+        if (serverEndTime > 0 && serverEndTime > Date.now()) {
+          const serverT = Math.max(0, Math.round((serverEndTime - Date.now()) / 1000));
+          // Only snap to server if within 2s to avoid visible jump from clock skew
+          if (Math.abs(serverT - t) <= 2 || t === 0) {
+            t = serverT;
+          } else if (t > 0) {
+            t--; // local decrement until next IPC update corrects it
+          }
         } else if (t > 0) {
           t--;
         }
@@ -360,8 +366,8 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
       if (data.sessionEndTime) serverEndTime = data.sessionEndTime;
 
       // Only hard-reset the local counter on significant external changes (add/reduce time)
-      // Small drifts (<= 5s) are ignored to prevent flickering
-      if(Math.abs(diff) > 5) t = data.timeLeft;
+      // Small drifts (<= 8s) are ignored to prevent flickering
+      if(Math.abs(diff) > 8) t = data.timeLeft;
 
       paused  = data.isPaused;
       sessdur = data.sessionDuration || sessdur;
