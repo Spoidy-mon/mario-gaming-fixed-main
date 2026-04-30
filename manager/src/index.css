@@ -3084,8 +3084,48 @@ body {
 .due-reason-chip { color: var(--text-muted); }
 .due-time-chip   { color: var(--text-muted); }
 
-.due-right-v2 {
+/* ── Session / Canteen split breakdown ── */
+.due-split-row {
   display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-card);
+}
+.due-split-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 10px;
+}
+.due-split-divider {
+  width: 1px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+.due-split-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.due-split-value {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--red);
+}
+.due-split-canteen {
+  color: var(--yellow, #f59e0b);
+}
+
+
+  .display { flex: 1; display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;

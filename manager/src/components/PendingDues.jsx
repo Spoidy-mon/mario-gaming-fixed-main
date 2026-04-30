@@ -205,7 +205,11 @@ function AddDueModal({ pcs, onClose }) {
 
 // ── Due Card ──────────────────────────────────────────────────────────────────
 function DueCard({ due, onCollect }) {
-  const isSession = due.auto || due.session_ref;
+  const isSession    = due.auto || due.session_ref;
+  const sessionDue   = due.session_due !== undefined ? due.session_due : (due.amount || 0);
+  const canteenDue   = due.canteen_due || 0;
+  const showSplit    = isSession && canteenDue > 0;
+
   return (
     <div className={`due-card-v2 ${isSession ? "due-session" : "due-manual"}`}>
       <div className="due-strip" />
@@ -221,6 +225,21 @@ function DueCard({ due, onCollect }) {
           {due.reason && <span className="due-meta-chip due-reason-chip">📝 {due.reason}</span>}
           <span className="due-meta-chip due-time-chip">🕐 {timeAgo(due.created_at)}</span>
         </div>
+
+        {/* ── Split breakdown: Session Due | Canteen Due ── */}
+        {showSplit && (
+          <div className="due-split-row">
+            <div className="due-split-col">
+              <span className="due-split-label">🖥 Session Due</span>
+              <span className="due-split-value">₹{sessionDue}</span>
+            </div>
+            <div className="due-split-divider" />
+            <div className="due-split-col">
+              <span className="due-split-label">🍔 Canteen Due</span>
+              <span className="due-split-value due-split-canteen">₹{canteenDue}</span>
+            </div>
+          </div>
+        )}
       </div>
       <div className="due-right-v2">
         <div className="due-amount-v2">₹{due.amount || 0}</div>
@@ -251,15 +270,29 @@ function CustomerCard({ group, onCollect }) {
       </div>
       {expanded && (
         <div className="customer-card-dues">
-          {group.dues.map(due => (
-            <div key={due.key} className="customer-due-row">
-              <span className="cdr-device">{due.pc_name || due.ps5_name || "General"}</span>
-              <span className="cdr-reason">{due.reason || "Due"}</span>
-              <span className="cdr-time">{timeAgo(due.created_at)}</span>
-              <span className="cdr-amount">₹{due.amount}</span>
-              <button className="btn-mini-collect" onClick={() => onCollect(due)}>Collect</button>
-            </div>
-          ))}
+          {group.dues.map(due => {
+            const sessionDue = due.session_due !== undefined ? due.session_due : (due.amount || 0);
+            const canteenDue = due.canteen_due || 0;
+            const showSplit  = (due.auto || due.session_ref) && canteenDue > 0;
+            return (
+              <div key={due.key} className="customer-due-row">
+                <span className="cdr-device">{due.pc_name || due.ps5_name || "General"}</span>
+                <span className="cdr-reason">{due.reason || "Due"}</span>
+                <span className="cdr-time">{timeAgo(due.created_at)}</span>
+                <span className="cdr-amount">
+                  ₹{due.amount}
+                  {showSplit && (
+                    <span className="cdr-split-hint">
+                      &nbsp;<span style={{color:"var(--text-muted)",fontSize:10}}>
+                        (🖥₹{sessionDue} + 🍔₹{canteenDue})
+                      </span>
+                    </span>
+                  )}
+                </span>
+                <button className="btn-mini-collect" onClick={() => onCollect(due)}>Collect</button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

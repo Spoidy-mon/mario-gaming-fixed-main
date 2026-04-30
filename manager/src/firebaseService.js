@@ -92,6 +92,8 @@ export async function quickStartSession(pcId, customerName, durationMinutes = 60
     device_type:    "pc",
     reason:         "Session started — payment pending",
     amount:         sessionPrice,     // ← correct amount shown in dues immediately
+    session_due:    sessionPrice,     // ← session portion (tracks separately from canteen)
+    canteen_due:    0,
     session_ref:    `pcs/${pcId}`,
     paid:           false,
     auto:           true,
@@ -274,12 +276,20 @@ export async function addTime(pcId, seconds, settings = {}) {
 
   const snap = await get(ref(db, `pcs/${pcId}`));
   const pc   = snap.val();
-  const balanceDue = pc?.balance_due || 0;
-  const dueReason  = `+${minutes}min added — total ₹${pc?.total_charge || 0}`;
+  const sessionBalanceDue  = pc?.balance_due || 0;
+  const canteenCharges     = pc?.canteen_charges || 0;
+  // Total due = session balance + any outstanding canteen charges
+  const totalDueAmount     = round2(sessionBalanceDue + canteenCharges);
+  const dueReason  = `+${minutes}min added — session ₹${pc?.total_charge || 0}`;
 
   if (pc?.due_key) {
-    if (balanceDue > 0) {
-      await update(ref(db, `pending_dues/${pc.due_key}`), { amount: balanceDue, reason: dueReason });
+    if (totalDueAmount > 0) {
+      await update(ref(db, `pending_dues/${pc.due_key}`), {
+        amount: totalDueAmount,
+        session_due: sessionBalanceDue,
+        canteen_due: canteenCharges,
+        reason: dueReason,
+      });
     } else {
       await update(ref(db, `pending_dues/${pc.due_key}`), { paid: true, paid_at: Date.now() });
     }
@@ -291,6 +301,8 @@ export async function addTime(pcId, seconds, settings = {}) {
       device_type: "pc",
       reason: dueReason,
       amount: addPrice,
+      session_due: addPrice,
+      canteen_due: 0,
       session_ref: `pcs/${pcId}`,
       paid: false, auto: true, created_at: Date.now(),
     });
@@ -345,13 +357,22 @@ export async function reduceTime(pcId, seconds, settings = {}) {
 
   const snap = await get(ref(db, `pcs/${pcId}`));
   const pc   = snap.val();
-  const dueReason = `-${minutes}min removed — total ₹${pc?.total_charge || 0}`;
+  const sessionBalanceDue = pc?.balance_due || 0;
+  const canteenCharges    = pc?.canteen_charges || 0;
+  // Total due always = session balance + canteen charges — reduce time never touches canteen
+  const totalDueAmount    = round2(sessionBalanceDue + canteenCharges);
+  const dueReason = `-${minutes}min removed — session ₹${pc?.total_charge || 0}`;
 
   if (pc?.due_key) {
-    if ((pc.balance_due || 0) <= 0) {
+    if (totalDueAmount <= 0) {
       await update(ref(db, `pending_dues/${pc.due_key}`), { paid: true, paid_at: Date.now() });
     } else {
-      await update(ref(db, `pending_dues/${pc.due_key}`), { amount: pc.balance_due, reason: dueReason });
+      await update(ref(db, `pending_dues/${pc.due_key}`), {
+        amount: totalDueAmount,
+        session_due: sessionBalanceDue,
+        canteen_due: canteenCharges,
+        reason: dueReason,
+      });
     }
   }
 
@@ -716,26 +737,36 @@ export async function sellItem(itemId, quantity, pcId, pcs, ps5Sessions, payment
     await update(ref(db, devicePath), { canteen_charges: newCanteenCharges });
 
     if (devData.due_key) {
-      // Update existing due — add canteen cost on top
+      // Update existing due — add canteen cost, keeping session_due separate from canteen_due
       const dueSnap = await get(ref(db, `pending_dues/${devData.due_key}`));
       const dueData = dueSnap.val() || {};
       if (!dueData.paid) {
+        const prevCanteenDue = dueData.canteen_due || 0;
+        const newCanteenDue  = round2(prevCanteenDue + total);
+        const sessionDue     = dueData.session_due !== undefined
+          ? dueData.session_due
+          : round2((dueData.amount || 0) - prevCanteenDue); // migrate old entries
         await update(ref(db, `pending_dues/${devData.due_key}`), {
-          amount: round2((dueData.amount || 0) + total),
-          reason: `Session + canteen — ₹${newCanteenCharges} canteen total`,
+          amount:      round2(sessionDue + newCanteenDue),
+          session_due: sessionDue,
+          canteen_due: newCanteenDue,
+          reason:      `Session + canteen — ₹${newCanteenCharges} canteen total`,
         });
       } else {
-        // Due was paid — create new due for canteen
-        await push(ref(db, "pending_dues"), {
+        // Due was paid — create new due for just this canteen charge
+        const newDue = await push(ref(db, "pending_dues"), {
           customer_name: device.customer_name || "",
           pc_id:         pc ? device.id : null,
           ps5_id:        ps5 ? device.id : null,
           pc_name:       deviceName, device_type: pc ? "pc" : "ps5",
           reason:        `Canteen: ${saleData.name}${quantity > 1 ? ` ×${quantity}` : ""}`,
           amount:        total,
+          session_due:   0,
+          canteen_due:   total,
           session_ref:   devicePath,
           paid: false, auto: true, created_at: now,
         });
+        await update(ref(db, devicePath), { due_key: newDue.key });
       }
     } else {
       // No due yet — create one for the canteen charge
@@ -746,6 +777,8 @@ export async function sellItem(itemId, quantity, pcId, pcs, ps5Sessions, payment
         pc_name:       deviceName, device_type: pc ? "pc" : "ps5",
         reason:        `Canteen: ${saleData.name}${quantity > 1 ? ` ×${quantity}` : ""}`,
         amount:        total,
+        session_due:   0,
+        canteen_due:   total,
         session_ref:   devicePath,
         paid: false, auto: true, created_at: now,
       });
