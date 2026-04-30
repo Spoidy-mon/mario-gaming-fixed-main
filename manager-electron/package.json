@@ -1,0 +1,53 @@
+{
+  "name": "mario-gaming-manager-desktop",
+  "version": "1.0.0",
+  "description": "Mario Gaming Café — Manager Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "dev": "set NODE_ENV=development && electron . --dev",
+    "build": "electron-builder --win --x64",
+    "build-portable": "electron-builder --win portable --x64"
+  },
+  "devDependencies": {
+    "electron": "^29.1.1",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.mariogaming.manager",
+    "productName": "Mario Gaming Café",
+    "copyright": "Mario Gaming Café",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**/*",
+      "!assets/icons/README.md"
+    ],
+    "extraFiles": [
+      {
+        "from": "../manager/build",
+        "to": "manager-build",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Mario Gaming Café",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "runAfterFinish": true
+    }
+  }
+}

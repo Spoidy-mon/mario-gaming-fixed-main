@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0a0e1a" />
+    <meta name="description" content="Mario Gaming Café - Management System" />
+    <title>Mario Gaming Café</title>
+    <!-- Favicon -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎮</text></svg>" />
+    <!-- Google Fonts preconnect -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&family=Nunito:wght@400;500;600;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet" />
+    <style>
+      /* Critical CSS to prevent flash of unstyled content */
+      body { margin: 0; background: #0a0e1a; color: #e8edf5; font-family: 'Nunito', sans-serif; }
+      #root { min-height: 100vh; }
+      /* Loading spinner shown before React mounts */
+      .pre-loader {
+        display: flex; align-items: center; justify-content: center;
+        height: 100vh; flex-direction: column; gap: 16px;
+      }
+      .pre-loader-icon { font-size: 56px; animation: spin 2s linear infinite; }
+      @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+      .pre-loader-text { font-size: 16px; color: #8899b4; }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Shown before React loads -->
+      <div class="pre-loader">
+        <div class="pre-loader-icon">🎮</div>
+        <div class="pre-loader-text">Loading Mario Gaming Café...</div>
+      </div>
+    </div>
+  </body>
+</html>

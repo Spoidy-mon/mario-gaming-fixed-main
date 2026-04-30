@@ -1,0 +1,31 @@
+cat > .gitignore << EOF
+# Node.js dependencies
+node_modules/
+**/node_modules/
+
+# Build and distribution folders (these cause the large file errors)
+dist/
+build/
+out/
+win-unpacked/
+release/
+*.exe
+*.msi
+*.dmg
+
+# Electron specific large files
+**/electron/dist/
+
+# Cache folders
+.cache/
+**/.cache/
+
+# Logs and temporary files
+*.log
+.env
+.DS_Store
+Thumbs.db
+
+# Package lock files (optional - keep if you want, but usually safe to keep)
+# package-lock.json
+EOF
