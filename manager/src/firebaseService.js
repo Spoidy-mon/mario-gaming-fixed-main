@@ -80,6 +80,7 @@ export async function quickStartSession(pcId, customerName, durationMinutes = 60
     paid_cash:        0,
     paid_upi:         0,
     extra_charges:    0,              // cumulative net extra time charges (+/-)
+    canteen_charges:  0,              // reset canteen on new session
     shutdown_delay:   null,
     timer_started_at: sessionStart,
     games_played:     "",
@@ -325,7 +326,7 @@ export async function addTime(pcId, seconds, settings = {}) {
     await addToCashBalance(addPrice, `addTime PC-${pcId}`);
   }
 
-  return { addedMinutes: minutes, chargeAdded: addPrice, newBalanceDue: balanceDue };
+  return { addedMinutes: minutes, chargeAdded: addPrice, newBalanceDue: totalDueAmount };
 }
 
 export async function reduceTime(pcId, seconds, settings = {}) {
@@ -338,15 +339,22 @@ export async function reduceTime(pcId, seconds, settings = {}) {
     pc.session_duration = Math.max(0, (pc.session_duration || 0) - seconds);
     pc.session_end_time = Math.max(Date.now(), (pc.session_end_time || Date.now()) - (seconds * 1000));
 
-    // Reduce from extra_charges first; if extra_charges run out, we cannot go below base_price.
-    const prevExtra  = pc.extra_charges || 0;
-    pc.extra_charges = round2(Math.max(0, prevExtra - deductPrice));
+    // Deduct from extra_charges first, then from base_price — no floor, can reduce to ₹0
+    const prevExtra   = pc.extra_charges || 0;
+    const basePrice   = pc.base_price || pc.payment_amount || pc.total_charge || 0;
+    let remaining     = deductPrice;
 
-    // base_price is the original frozen session charge (set at session start or on first addTime)
-    const basePrice  = pc.base_price || pc.payment_amount || pc.total_charge || 0;
-    pc.base_price    = round2(basePrice); // ensure it stays frozen
-    // total = base + whatever extra_charges remain after the deduction
-    pc.total_charge  = round2(Math.max(0, pc.base_price + pc.extra_charges));
+    // 1. Eat into extra_charges first
+    const extraDeduct  = Math.min(prevExtra, remaining);
+    pc.extra_charges   = round2(prevExtra - extraDeduct);
+    remaining          = round2(remaining - extraDeduct);
+
+    // 2. Whatever is left, reduce base_price (can go to 0 — override original session price)
+    const newBasePrice = round2(Math.max(0, basePrice - remaining));
+    pc.base_price      = newBasePrice;
+
+    // total_charge = new base + remaining extra
+    pc.total_charge    = round2(Math.max(0, pc.base_price + pc.extra_charges));
 
     const alreadyPaid = round2((pc.paid_cash || pc.payment_cash || 0) + (pc.paid_upi || pc.payment_upi || 0));
     pc.balance_due    = round2(Math.max(0, pc.total_charge - alreadyPaid));
@@ -423,7 +431,8 @@ export async function endSession(pcId, pcs) {
     paid_seconds: 0, free_seconds: 0, is_paused: false,
     customer_name: "", customer_phone: "", customer_address: "", games_played: "",
     payment_mode: "", payment_amount: 0, payment_cash: 0, payment_upi: 0,
-    payment_status: null, due_key: null,
+    payment_status: null, due_key: null, canteen_charges: 0,
+    extra_charges: 0, base_price: 0, total_charge: 0, balance_due: 0,
     timer_started_at: null, paused_at: null,
     shutdown_command: null, welcome_overlay: null,
   });
@@ -459,7 +468,8 @@ export async function setSessionEnded(pcId, pcData) {
     session_start: null, is_paused: false,
     customer_name: "", customer_phone: "", customer_address: "", games_played: "",
     payment_mode: "", payment_amount: 0, payment_cash: 0, payment_upi: 0,
-    payment_status: null, due_key: null,
+    payment_status: null, due_key: null, canteen_charges: 0,
+    extra_charges: 0, base_price: 0, total_charge: 0, balance_due: 0,
     timer_started_at: null, paused_at: null,
     shutdown_command: null, welcome_overlay: null,
   });
@@ -808,18 +818,70 @@ export function listenSales(callback) {
   });
 }
 export async function returnItem(saleKey, sale) {
+  // 1. Restock the item
   await runTransaction(ref(db, `canteen_items/${sale.item_id}`), (item) => {
     if (!item) return item;
     item.stock = (item.stock || 0) + Number(sale.quantity);
     return item;
   });
+
+  // 2. Mark sale as returned
   await update(ref(db, `sales/${saleKey}`), { returned: true, returned_at: Date.now() });
+
+  // 3. Log the return
   await push(ref(db, "returns"), {
     sale_key: saleKey, item_id: sale.item_id, item_name: sale.item_name,
     quantity: sale.quantity, refund_amount: sale.total,
     pc_id: sale.pc_id || null, pc_name: sale.pc_name || null,
     customer_name: sale.customer_name || null, returned_at: Date.now(),
   });
+
+  // 4. If this was a "charge to session" sale, reverse it from the due + PC node
+  if (sale.payment_mode === "charge" && (sale.pc_id || sale.ps5_id)) {
+    const isPc      = !!sale.pc_id;
+    const deviceId  = isPc ? sale.pc_id : sale.ps5_id;
+    const devicePath = isPc ? `pcs/${deviceId}` : `ps5_sessions/${deviceId}`;
+    const refundAmt  = round2(sale.total || 0);
+
+    // Read PC/PS5 node
+    const devSnap = await get(ref(db, devicePath));
+    const devData = devSnap.val() || {};
+
+    // Reduce canteen_charges on device node (floor at 0)
+    const newCanteenCharges = round2(Math.max(0, (devData.canteen_charges || 0) - refundAmt));
+    await update(ref(db, devicePath), { canteen_charges: newCanteenCharges });
+
+    // Update the pending due if it exists and is unpaid
+    if (devData.due_key) {
+      const dueSnap = await get(ref(db, `pending_dues/${devData.due_key}`));
+      const dueData = dueSnap.val() || {};
+
+      if (!dueData.paid) {
+        const prevCanteenDue = round2(dueData.canteen_due || 0);
+        const newCanteenDue  = round2(Math.max(0, prevCanteenDue - refundAmt));
+        const sessionDue     = round2(dueData.session_due !== undefined
+          ? dueData.session_due
+          : Math.max(0, (dueData.amount || 0) - prevCanteenDue));
+        const newTotal       = round2(sessionDue + newCanteenDue);
+
+        if (newTotal <= 0) {
+          // Fully cleared — mark due paid
+          await update(ref(db, `pending_dues/${devData.due_key}`), {
+            paid: true, paid_at: Date.now(),
+            amount: 0, session_due: sessionDue, canteen_due: 0,
+            reason: `Canteen item returned — fully cleared`,
+          });
+        } else {
+          await update(ref(db, `pending_dues/${devData.due_key}`), {
+            amount:      newTotal,
+            session_due: sessionDue,
+            canteen_due: newCanteenDue,
+            reason:      `Canteen item returned — ₹${refundAmt} refunded`,
+          });
+        }
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
