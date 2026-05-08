@@ -24,11 +24,18 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, "preload.js"),
+      webSecurity: false,
     },
     backgroundColor: "#0a0e1a",
     show: false,
     titleBarStyle: "default",
   });
+
+  // Allow Firebase + Google Fonts network requests in Electron
+  mainWindow.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
+    callback({ requestHeaders: details.requestHeaders });
+  });
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, _permission, cb) => cb(true));
 
   // In production, load the bundled React app
   // The build is placed at ../manager/build by electron-builder extraFiles
@@ -37,10 +44,22 @@ function createWindow() {
     mainWindow.webContents.openDevTools();
   } else {
     // Try packed path first, then dev path
-    const buildPath = path.join(process.resourcesPath, "manager-build", "index.html");
-    const devPath   = path.join(__dirname, "..", "manager", "build", "index.html");
-    const loadPath  = require("fs").existsSync(buildPath) ? buildPath : devPath;
-    mainWindow.loadFile(loadPath);
+    // When installed via NSIS: manager-build sits next to the exe (extraFiles -> app root)
+    // __dirname inside asar = app.asar, so we go up to the actual install folder
+    const exeDir    = path.dirname(process.execPath);
+    const p1 = path.join(exeDir, "manager-build", "index.html");              // installed EXE
+    const p2 = path.join(process.resourcesPath, "manager-build", "index.html"); // packed asar fallback
+    const p3 = path.join(__dirname, "..", "manager", "build", "index.html");    // dev fallback
+
+    const loadPath = [p1, p2, p3].find(p => require("fs").existsSync(p));
+
+    if (!loadPath) {
+      // Show a helpful error instead of blank screen
+      mainWindow.loadURL("data:text/html,<h2 style='font-family:sans-serif;color:#ff6b6b;padding:40px'>" +
+        "Build not found!<br><small>Run: npm run build in the manager/ folder first, then rebuild the EXE.</small></h2>");
+    } else {
+      mainWindow.loadFile(loadPath);
+    }
   }
 
   mainWindow.once("ready-to-show", () => {
