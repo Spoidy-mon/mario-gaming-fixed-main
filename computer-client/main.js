@@ -14,6 +14,7 @@ const WARN_SECS       = 600;  // 10 minutes — force-show + highlight
 // ── State ─────────────────────────────────────────────────────────────────────
 let tray            = null;
 let countdownBar    = null;
+let barCreating     = false;   // guard: true while a new bar BrowserWindow is being built
 let screensaverWin  = null;
 let warningWin      = null;
 let shutdownWin     = null;
@@ -32,6 +33,37 @@ let settings        = { shutdownDelay: 30, warningAt: 300 };
 // unkillable by accident (e.g. last window closed) while still allowing
 // admin-triggered shutdown / relaunch to work cleanly.
 let isQuitting = false;
+
+// ── Work-area reservation ─────────────────────────────────────────────────────
+// Tells Windows to treat the left BAR_WIDTH_OPEN pixels as reserved (like the
+// taskbar reserves the bottom edge). Every maximised or newly-opened window
+// will automatically start to the right of the sidebar — no overlap ever.
+// Uses PowerShell + SystemParametersInfo SPI_SETWORKAREA (uiAction = 47).
+function reserveLeftEdge(pixelWidth) {
+  if (process.platform !== "win32") return;
+  try {
+    const { bounds } = screen.getPrimaryDisplay();
+    const ps = [
+      "Add-Type -TypeDefinition @'",
+      "using System;",
+      "using System.Runtime.InteropServices;",
+      "public struct RECT { public int l, t, r, b; }",
+      "public class WinAPI {",
+      "  [DllImport(\"user32.dll\")]",
+      "  public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);",
+      "}",
+      "'@",
+      "$r = New-Object WinAPI+RECT",
+      `$r.l = ${pixelWidth}; $r.t = 0; $r.r = ${bounds.width}; $r.b = ${bounds.height}`,
+      "[WinAPI]::SystemParametersInfo(47, 0, [ref]$r, 2)",
+    ].join("; ");
+    require("child_process").execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, { timeout: 5000 });
+  } catch (e) {
+    console.warn("reserveLeftEdge failed:", e.message);
+  }
+}
+
+function restoreWorkArea() { reserveLeftEdge(0); }
 
 // ── Firebase helpers ──────────────────────────────────────────────────────────
 async function fbGet(path) {
@@ -147,11 +179,12 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
   #slider{
     position:fixed;top:0;left:0;
     width:${BAR_WIDTH_OPEN}px;height:100vh;
-    transform:translateX(calc(-${BAR_WIDTH_OPEN}px + ${BAR_WIDTH}px));
-    transition:transform .35s cubic-bezier(.4,0,.2,1);
+    transform:translateX(-${BAR_WIDTH_OPEN}px);
+    opacity:0;
+    transition:transform .35s cubic-bezier(.4,0,.2,1), opacity .25s ease;
     z-index:9999;
   }
-  #slider.visible{ transform:translateX(0); }
+  #slider.visible{ transform:translateX(0); opacity:1; }
   .bar{
     width:100%;height:100%;
     background:rgba(5,10,20,0.93);
@@ -169,6 +202,16 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
     box-shadow:0 0 12px var(--gc,rgba(16,185,129,.5));
     transition:background .4s,box-shadow .4s;
   }
+  #close-btn{
+    position:absolute;top:8px;right:6px;
+    width:18px;height:18px;border-radius:50%;
+    background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
+    color:rgba(255,255,255,0.5);font-size:11px;line-height:18px;text-align:center;
+    cursor:pointer;z-index:10;transition:background .2s,color .2s;
+    user-select:none;
+  }
+  #close-btn:hover{background:rgba(239,68,68,0.3);color:#fff;border-color:rgba(239,68,68,0.5);}
+
   /* Progress fill from top */
   #progress{
     position:absolute;top:0;left:0;width:100%;
@@ -243,6 +286,7 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
 </head><body>
 <div id="slider">
   <div class="bar">
+    <button id="close-btn" title="Hide">✕</button>
     <div id="progress" style="height:${pct}%"></div>
     <div class="dot ${!isPaused && !isLow ? "pulse" : ""}" id="dot"></div>
     <div class="label" id="label">${label}</div>
@@ -260,35 +304,38 @@ function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration
   let serverEndTime = ${sessionEndTime || 0};   // server-anchored epoch ms
   const WARN_AT   = ${warningAt || 300};   // low-time threshold (default 5 min)
   const FORCE_AT  = ${WARN_SECS};          // force-show + highlight at 10 min
-  const HIDE_DELAY = 4000;                 // auto-hide after 4 s inactivity
+  const HIDE_DELAY = 1500;                 // auto-hide after 1.5s inactivity
 
   const slider  = document.getElementById("slider");
   let hideTimer = null;
 
   // ── Visibility helpers ────────────────────────────────────────────────────
-  function showBar(temporary) {
+  function showBar() {
+    clearTimeout(hideTimer);
     slider.classList.add("visible");
-    if(temporary) scheduleHide();
+    if(window.barApi) window.barApi.setMousePass(false);
+    // Always auto-hide after HIDE_DELAY regardless of cursor position
+    hideTimer = setTimeout(hideBar, HIDE_DELAY);
   }
   function hideBar() {
-    // Never hide when in warning/forced state
     if(slider.classList.contains("warning")) return;
-    slider.classList.remove("visible");
-  }
-  function scheduleHide() {
     clearTimeout(hideTimer);
-    hideTimer = setTimeout(hideBar, HIDE_DELAY);
+    slider.classList.remove("visible");
+    if(window.barApi) window.barApi.setMousePass(true);
   }
 
   // Show on load briefly, then hide
-  showBar(true);
+  showBar();
 
-  // Mouse near left edge (within 60px) → slide in
+  // Mouse within 5px of left edge → show bar (auto-hides after HIDE_DELAY)
   document.addEventListener("mousemove", e => {
-    if(e.clientX < 60 || slider.classList.contains("visible")) {
-      showBar(e.clientX >= 60); // if cursor leaves edge zone, start hide timer
+    if(e.clientX <= 5 && !slider.classList.contains("visible")) {
+      showBar();
     }
   });
+
+  // Manual close button click
+  document.getElementById("close-btn").addEventListener("click", hideBar);
 
   // ── State renderer ────────────────────────────────────────────────────────
   function fmt(s){
@@ -418,6 +465,13 @@ function showCountdownBar(timeLeft, isPaused, customerName, sessionDuration) {
     return;
   }
 
+  // Guard against a second call while the first BrowserWindow is still being
+  // constructed (e.g. whenReady creates the bar, then the first pollStatus
+  // fires 1.5s later before webContents is ready — without this guard a second
+  // window would be built because countdownBar.isDestroyed() hasn't settled).
+  if (barCreating) return;
+  barCreating = true;
+
   // Build and show fresh bar
   const html = buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration, warningAt, currentPCData?.session_end_time || 0);
 
@@ -441,11 +495,37 @@ function showCountdownBar(timeLeft, isPaused, customerName, sessionDuration) {
     },
   });
 
-  // Allow mouse events — the renderer handles hover-to-reveal;
-  // pass-through is managed per-region inside the HTML.
-  countdownBar.setIgnoreMouseEvents(false);
+  // Start fully transparent to mouse — the bar is visually hidden (slid off-screen)
+  // on load. The renderer sends IPC "bar-mouse-pass" to toggle hit-testing:
+  //   pass=true  → window is click-through (bar is collapsed / hidden)
+  //   pass=false → window accepts clicks (bar is expanded / visible)
+  // forward:true ensures OS mouse events still reach windows underneath while passing.
+  countdownBar.setIgnoreMouseEvents(true, { forward: true });
+
+  // Listen for the renderer's visibility signal and toggle hit-testing accordingly.
+  // Remove any old listener first to avoid duplicates across re-creations.
+  ipcMain.removeAllListeners("bar-mouse-pass");
+  ipcMain.on("bar-mouse-pass", (_, pass) => {
+    if (countdownBar && !countdownBar.isDestroyed()) {
+      countdownBar.setIgnoreMouseEvents(pass, { forward: true });
+    }
+    // Reserve 0px when bar is fully hidden so desktop is completely unobstructed;
+    // expand to 200px only while the bar is open and in use.
+    reserveLeftEdge(pass ? 0 : BAR_WIDTH_OPEN);
+  });
+
   countdownBar.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
   keepOnTop(countdownBar);
+
+  // Release the creation guard once the window has actually loaded so that
+  // any subsequent showCountdownBar() call can safely send IPC updates instead.
+  // Also reserve the left edge now that the bar is visible.
+  countdownBar.webContents.once("did-finish-load", () => {
+    barCreating = false;
+    // Bar starts completely hidden — reserve 0px so full screen is usable.
+    // It expands to 200px via IPC only when the bar slides open.
+    reserveLeftEdge(0);
+  });
 
   setInterval(() => {
     if (countdownBar && !countdownBar.isDestroyed()) keepOnTop(countdownBar);
@@ -453,8 +533,10 @@ function showCountdownBar(timeLeft, isPaused, customerName, sessionDuration) {
 }
 
 function hideCountdownBar() {
+  barCreating = false;   // reset guard in case bar is torn down before load completes
   destroyWin(countdownBar);
   countdownBar = null;
+  restoreWorkArea();
 }
 
 // ── Screensaver ───────────────────────────────────────────────────────────────
@@ -639,7 +721,16 @@ const iv=setInterval(()=>{s--;el.textContent=s;if(s<=0)clearInterval(iv);},1000)
 async function register() {
   const pc = await fbGet(`pcs/${DEVICE_ID}`);
   if (pc) {
-    await fbPatch(`pcs/${DEVICE_ID}`, { status: "online", shutdown_command: null });
+    // Only reset to "online" if there is no active session running.
+    // Overwriting an active session's status here causes pollStatus() to
+    // immediately see lastStatus="active" + status="online" and trigger
+    // the shutdown countdown on every client startup.
+    if (pc.status !== "active") {
+      await fbPatch(`pcs/${DEVICE_ID}`, { status: "online", shutdown_command: null });
+    } else {
+      // Still clear any stale shutdown command but leave status alone.
+      await fbPatch(`pcs/${DEVICE_ID}`, { shutdown_command: null });
+    }
     lastStatus = pc.status === "active" ? "active" : "online";
     currentPCData = pc;
     console.log(`✅ PC-0${DEVICE_ID} registered`);
@@ -791,5 +882,6 @@ app.on("window-all-closed", () => { /* intentionally empty — do not quit */ })
 // Block accidental/OS-triggered quits (e.g. Task Scheduler end-task, Squirrel
 // update signals, etc.).  Only allow quit when WE set isQuitting = true first.
 app.on("before-quit", e => {
-  if (!isQuitting) e.preventDefault();
+  if (!isQuitting) { e.preventDefault(); return; }
+  restoreWorkArea();  // always give the screen back before exiting
 });
