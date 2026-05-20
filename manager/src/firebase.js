@@ -10,9 +10,10 @@ const firebaseConfig = {
   projectId: "mario-gaming-cafe",
   storageBucket: "mario-gaming-cafe.firebasestorage.app",
   messagingSenderId: "655135892566",
-  appId: "1:655135892566:web:3bdd7fb09718db04d607f7",
-  measurementId: "G-VHRREN1EFH"
+  appId: "1:655135892566:web:21c88f6d05c67383d607f7",
+  measurementId: "G-32WWGZMSM5"
 };
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = initializeApp(firebaseConfig);
