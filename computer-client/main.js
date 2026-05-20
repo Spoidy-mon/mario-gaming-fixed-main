@@ -5,6 +5,13 @@ const path = require("path");
 // ── Config ────────────────────────────────────────────────────────────────────
 const DEVICE_ID       = 1;   // ← CHANGE THIS per PC (1, 2, 3 …)
 const FIREBASE_DB_URL = `https://mario-gaming-cafe-default-rtdb.asia-southeast1.firebasedatabase.app`;
+const FIREBASE_API_KEY         = "AIzaSyD9yPXFS3bKUvnabbxnOHAaXz8lc9venUg";
+const FIREBASE_AUTH_DOMAIN     = "mario-gaming-cafe.firebaseapp.com";
+const FIREBASE_PROJECT_ID      = "mario-gaming-cafe";
+const FIREBASE_STORAGE_BUCKET  = "mario-gaming-cafe.firebasestorage.app";
+const FIREBASE_MESSAGING_ID    = "655135892566";
+const FIREBASE_APP_ID          = "1:655135892566:web:21c88f6d05c67383d607f7";
+const FIREBASE_MEASUREMENT_ID  = "G-32WWGZMSM5";
 const POLL_INTERVAL   = 1500;
 const BAR_HEIGHT      = 44;   // kept for legacy reference
 const BAR_WIDTH       = 56;   // vertical bar width (collapsed peek)
