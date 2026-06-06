@@ -860,16 +860,22 @@ app.whenReady().then(async () => {
   }
 
   setupTray();
+
+  // ── Show screensaver IMMEDIATELY — no blank screen while Firebase loads ────
+  // The screensaver is shown first so the customer always sees the lock screen
+  // from the very first frame, even before Firebase has responded.
+  // It will be hidden below if we find an already-active session.
+  showScreensaver();
+
   await register();
 
   // ── Initial screen decision (boot-time lock) ────────────────────────────────
   // Re-read Firebase fresh after register() so we have the latest status.
-  // If the PC is not in an active paid session → block immediately with screensaver.
-  // This means the customer sees the lock screen from the very first frame.
+  // If an active session is running, swap screensaver → countdown bar.
+  // Otherwise the screensaver stays (it's already visible).
   const initPc = await fbGet(`pcs/${DEVICE_ID}`);
-  if (!initPc || initPc.status !== "active") {
-    showScreensaver();
-  } else {
+  if (initPc && initPc.status === "active") {
+    hideScreensaver();
     showCountdownBar(
       Math.floor(initPc.time_remaining || 0),
       !!initPc.is_paused,
