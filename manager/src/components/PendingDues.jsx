@@ -26,27 +26,44 @@ function CollectModal({ due, onClose, onPaid }) {
   const [upiAmt,  setUpiAmt]  = useState("");
   const [saving,  setSaving]  = useState(false);
 
-  const dueAmt    = due.amount || 0;
-  const cashNum   = Number(cashAmt || 0);
-  const upiNum    = Number(upiAmt  || 0);
-  const totalPaid = payMode === "split" ? cashNum + upiNum : dueAmt;
-  const balance   = Math.max(0, dueAmt - totalPaid);
-  const overpaid  = totalPaid > dueAmt;
-  const canConfirm = payMode !== "split" || totalPaid > 0;
+  const dueAmt  = due.amount || 0;
+  const cashNum = Number(cashAmt || 0);
+  const upiNum  = Number(upiAmt  || 0);
+
+  // For cash/upi: use the entered amount (not dueAmt). For split: sum both.
+  const totalPaid = payMode === "cash"  ? cashNum
+                  : payMode === "upi"   ? upiNum
+                  : cashNum + upiNum;   // split
+
+  const balance  = Math.max(0, dueAmt - totalPaid);
+  const overpaid = totalPaid > dueAmt;
+  const isPartial = totalPaid > 0 && balance > 0;
+  const isFullyPaid = totalPaid >= dueAmt && totalPaid > 0;
+  const canConfirm = totalPaid > 0;
 
   const handlePay = async () => {
     if (!canConfirm) return toast.error("Enter payment amount");
+    if (totalPaid <= 0) return toast.error("Amount must be greater than 0");
     setSaving(true);
     try {
-      const paidCash = payMode === "cash"  ? dueAmt : payMode === "split" ? cashNum : 0;
-      const paidUpi  = payMode === "upi"   ? dueAmt : payMode === "split" ? upiNum  : 0;
+      const paidCash = payMode === "cash" ? cashNum : payMode === "split" ? cashNum : 0;
+      const paidUpi  = payMode === "upi"  ? upiNum  : payMode === "split" ? upiNum  : 0;
+
       await markDuePaid(due.key, {
-        mode:        payMode === "split" ? "split" : payMode,
-        amount:      dueAmt,
-        cash_amount: paidCash,
-        upi_amount:  paidUpi,
+        mode:           payMode,
+        amount:         dueAmt,
+        paid_amount:    totalPaid,
+        cash_amount:    paidCash,
+        upi_amount:     paidUpi,
+        remaining:      balance,
+        fully_paid:     isFullyPaid,
       });
-      toast.success(`✅ ₹${dueAmt} collected from ${due.customer_name || "customer"}`);
+
+      if (isFullyPaid) {
+        toast.success(`✅ ₹${totalPaid} collected — Due fully cleared!`);
+      } else {
+        toast.info(`💵 ₹${totalPaid} collected — ₹${balance} still remaining`);
+      }
       onPaid();
     } catch (e) {
       toast.error(e.message || "Payment failed");
@@ -102,6 +119,29 @@ function CollectModal({ due, onClose, onPaid }) {
           </div>
         </div>
 
+        {/* Amount inputs for all modes */}
+        {payMode === "cash" && (
+          <div className="modal-section">
+            <label className="settings-label">💵 Cash Amount Received</label>
+            <input className="input-name" type="number" min="0" placeholder={`₹${dueAmt} (full)`}
+              value={cashAmt} onChange={e=>setCashAmt(e.target.value)} autoFocus />
+            <div style={{display:"flex",gap:6,marginTop:6}}>
+              <button className="btn btn-duration" onClick={()=>setCashAmt(String(dueAmt))}>Full ₹{dueAmt}</button>
+              <button className="btn btn-duration" onClick={()=>setCashAmt(String(Math.round(dueAmt/2)))}>Half</button>
+            </div>
+          </div>
+        )}
+        {payMode === "upi" && (
+          <div className="modal-section">
+            <label className="settings-label">📱 UPI Amount Received</label>
+            <input className="input-name" type="number" min="0" placeholder={`₹${dueAmt} (full)`}
+              value={upiAmt} onChange={e=>setUpiAmt(e.target.value)} autoFocus />
+            <div style={{display:"flex",gap:6,marginTop:6}}>
+              <button className="btn btn-duration" onClick={()=>setUpiAmt(String(dueAmt))}>Full ₹{dueAmt}</button>
+              <button className="btn btn-duration" onClick={()=>setUpiAmt(String(Math.round(dueAmt/2)))}>Half</button>
+            </div>
+          </div>
+        )}
         {payMode === "split" && (
           <div className="modal-section">
             <div className="split-inputs-row">
@@ -114,17 +154,24 @@ function CollectModal({ due, onClose, onPaid }) {
                 <input className="input-name" type="number" min="0" placeholder="₹0" value={upiAmt} onChange={e => setUpiAmt(e.target.value)} />
               </div>
             </div>
-            <div className="split-status-row">
-              <span>Total: <strong style={{color:"var(--green)"}}>₹{totalPaid}</strong></span>
-              {balance > 0 && <span style={{color:"var(--red)"}}>Still due: ₹{balance}</span>}
-              {overpaid && <span style={{color:"var(--yellow)"}}>⚠ Overpaid ₹{totalPaid - dueAmt}</span>}
-            </div>
+          </div>
+        )}
+
+        {/* Payment summary */}
+        {totalPaid > 0 && (
+          <div className="split-status-row" style={{margin:"0 0 12px"}}>
+            <span>Collected: <strong style={{color:"var(--green)"}}>₹{totalPaid}</strong></span>
+            {isPartial && <span style={{color:"var(--red,#f87171)",fontWeight:600}}>Still due: ₹{balance}</span>}
+            {isFullyPaid && <span style={{color:"#10b981",fontWeight:600}}>✅ Fully paid</span>}
+            {overpaid && <span style={{color:"var(--yellow)"}}>⚠ Overpaid ₹{totalPaid - dueAmt}</span>}
           </div>
         )}
 
         <div className="collect-modal-actions">
           <button className="btn btn-start" onClick={handlePay} disabled={saving || !canConfirm} style={{flex:1}}>
-            {saving ? "Processing…" : `✅ Collect ₹${dueAmt}`}
+            {saving ? "Processing…"
+              : isPartial ? `💵 Collect ₹${totalPaid} (₹${balance} left)`
+              : `✅ Collect ₹${totalPaid || dueAmt}`}
           </button>
           <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
         </div>

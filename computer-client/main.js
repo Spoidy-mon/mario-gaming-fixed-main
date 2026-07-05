@@ -3,7 +3,7 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, screen, ipcMain, dialog } =
 const path = require("path");
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const DEVICE_ID       = 1;   // ← CHANGE THIS per PC (1, 2, 3 …)
+const DEVICE_ID       = 9;   // ← CHANGE THIS per PC (1, 2, 3 …)
 const FIREBASE_DB_URL = `https://mario-gaming-cafe-default-rtdb.asia-southeast1.firebasedatabase.app`;
 const FIREBASE_API_KEY         = "AIzaSyD9yPXFS3bKUvnabbxnOHAaXz8lc9venUg";
 const FIREBASE_AUTH_DOMAIN     = "mario-gaming-cafe.firebaseapp.com";
@@ -13,15 +13,9 @@ const FIREBASE_MESSAGING_ID    = "655135892566";
 const FIREBASE_APP_ID          = "1:655135892566:web:21c88f6d05c67383d607f7";
 const FIREBASE_MEASUREMENT_ID  = "G-32WWGZMSM5";
 const POLL_INTERVAL   = 1500;
-const BAR_HEIGHT      = 44;   // kept for legacy reference
-const BAR_WIDTH       = 56;   // vertical bar width (collapsed peek)
-const BAR_WIDTH_OPEN  = 200;  // vertical bar width (expanded)
-const WARN_SECS       = 600;  // 10 minutes — force-show + highlight
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let tray            = null;
-let countdownBar    = null;
-let barCreating     = false;   // guard: true while a new bar BrowserWindow is being built
 let screensaverWin  = null;
 let warningWin      = null;
 let shutdownWin     = null;
@@ -30,6 +24,7 @@ let shutdownTicker  = null;
 let lastStatus      = null;
 let lastTimeLeft    = null;
 let lastShutdownCmd = null;
+let shutdownFired   = false;  // prevents epoch-expired from re-triggering every poll
 let warningShown    = false;
 let currentPCData   = null;
 let settings        = { shutdownDelay: 30, warningAt: 300 };
@@ -41,38 +36,25 @@ let settings        = { shutdownDelay: 30, warningAt: 300 };
 // admin-triggered shutdown / relaunch to work cleanly.
 let isQuitting = false;
 
-// ── Work-area reservation ─────────────────────────────────────────────────────
-// Tells Windows to treat the left BAR_WIDTH_OPEN pixels as reserved (like the
-// taskbar reserves the bottom edge). Every maximised or newly-opened window
-// will automatically start to the right of the sidebar — no overlap ever.
-// Uses PowerShell + SystemParametersInfo SPI_SETWORKAREA (uiAction = 47).
-function reserveLeftEdge(pixelWidth) {
-  if (process.platform !== "win32") return;
-  try {
-    const { bounds } = screen.getPrimaryDisplay();
-    const ps = [
-      "Add-Type -TypeDefinition @'",
-      "using System;",
-      "using System.Runtime.InteropServices;",
-      "public struct RECT { public int l, t, r, b; }",
-      "public class WinAPI {",
-      "  [DllImport(\"user32.dll\")]",
-      "  public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);",
-      "}",
-      "'@",
-      "$r = New-Object WinAPI+RECT",
-      `$r.l = ${pixelWidth}; $r.t = 0; $r.r = ${bounds.width}; $r.b = ${bounds.height}`,
-      "[WinAPI]::SystemParametersInfo(47, 0, [ref]$r, 2)",
-    ].join("; ");
-    require("child_process").execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, { timeout: 5000 });
-  } catch (e) {
-    console.warn("reserveLeftEdge failed:", e.message);
-  }
-}
-
-function restoreWorkArea() { reserveLeftEdge(0); }
 
 // ── Firebase helpers ──────────────────────────────────────────────────────────
+// Server time offset — eliminates clock skew between manager and client machines
+// Firebase .info/serverTimeOffset = Firebase server time - local time (ms)
+let _serverOffset = 0;
+
+function startServerOffsetSync() {
+  // Poll the offset every 30s to stay accurate
+  function sync() {
+    fetch(`${FIREBASE_DB_URL}/.info/serverTimeOffset.json`)
+      .then(r => r.json())
+      .then(v => { if (typeof v === "number") _serverOffset = v; })
+      .catch(() => {});
+  }
+  sync();
+  setInterval(sync, 30000);
+}
+
+function serverNow() { return Date.now() + _serverOffset; }
 async function fbGet(path) {
   try {
     const r = await fetch(`${FIREBASE_DB_URL}/${path}.json`);
@@ -147,405 +129,6 @@ function updateTray(status, timeLeft) {
   tray.setContextMenu(buildTrayMenu(status, timeLeft));
 }
 
-// ── Countdown Bar ─────────────────────────────────────────────────────────────
-// The bar has its own internal 1s countdown driven by JS.
-// When add/reduce time happens from the manager, pollStatus gets the NEW
-// time_remaining from Firebase and calls updateCountdownBar() which sends
-// the corrected value directly into the bar's running script via IPC.
-// This is the FIX for Bug 1 — the bar was never receiving the updated value.
-
-function buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration, warningAt, sessionEndTime = 0) {
-  const dur = sessionDuration || Math.max(timeLeft, 3600);
-  const fmt = s => {
-    if (!s || s <= 0) return "00:00:00";
-    return [Math.floor(s/3600), Math.floor((s%3600)/60), s%60]
-      .map(v => String(v).padStart(2,"0")).join(":");
-  };
-  const pct      = Math.min(100, Math.max(0, (timeLeft / dur) * 100));
-  const isLow    = timeLeft > 0 && timeLeft <= (warningAt || 300);
-  const isWarn10 = timeLeft > 0 && timeLeft <= WARN_SECS; // ≤10 min warning
-  const timeStr  = fmt(timeLeft);
-  const name     = customerName ? customerName : "";
-  const label    = isPaused ? "PAUSED" : isLow ? "LOW TIME" : "SESSION";
-  const barColor = isPaused ? "#f59e0b" : (isWarn10 || isLow) ? "#ef4444" : "#10b981";
-
-  // The bar is a narrow vertical strip on the LEFT edge.
-  // It auto-hides (slides off-screen to the left) after 4 seconds of inactivity.
-  // Mouse movement near the left edge (mousemove on document) slides it back in.
-  // When ≤10 min, it force-shows itself and glows orange/red.
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@600;700&display=swap');
-  *{margin:0;padding:0;box-sizing:border-box}
-  html,body{
-    width:${BAR_WIDTH_OPEN}px;height:100vh;
-    background:transparent;overflow:hidden;
-    -webkit-app-region:no-drag;user-select:none;
-  }
-  /* Outer wrapper handles the slide transform */
-  #slider{
-    position:fixed;top:0;left:0;
-    width:${BAR_WIDTH_OPEN}px;height:100vh;
-    transform:translateX(-${BAR_WIDTH_OPEN}px);
-    opacity:0;
-    transition:transform .35s cubic-bezier(.4,0,.2,1), opacity .25s ease;
-    z-index:9999;
-  }
-  #slider.visible{ transform:translateX(0); opacity:1; }
-  .bar{
-    width:100%;height:100%;
-    background:rgba(5,10,20,0.93);
-    backdrop-filter:blur(18px);
-    border-right:1px solid rgba(255,255,255,0.07);
-    box-shadow:4px 0 32px rgba(0,0,0,.6);
-    display:flex;flex-direction:column;align-items:center;
-    padding:20px 0 16px;gap:0;
-    position:relative;overflow:hidden;
-  }
-  /* Accent glow strip on the right edge */
-  .bar::after{
-    content:'';position:absolute;top:0;right:0;width:2px;height:100%;
-    background:var(--bc,#10b981);
-    box-shadow:0 0 12px var(--gc,rgba(16,185,129,.5));
-    transition:background .4s,box-shadow .4s;
-  }
-  #close-btn{
-    position:absolute;top:8px;right:6px;
-    width:18px;height:18px;border-radius:50%;
-    background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
-    color:rgba(255,255,255,0.5);font-size:11px;line-height:18px;text-align:center;
-    cursor:pointer;z-index:10;transition:background .2s,color .2s;
-    user-select:none;
-  }
-  #close-btn:hover{background:rgba(239,68,68,0.3);color:#fff;border-color:rgba(239,68,68,0.5);}
-
-  /* Progress fill from top */
-  #progress{
-    position:absolute;top:0;left:0;width:100%;
-    background:var(--bc,#10b981);opacity:.12;
-    transition:height 1s linear,background .4s;
-    pointer-events:none;
-  }
-  .dot{
-    width:10px;height:10px;border-radius:50%;
-    background:var(--bc,#10b981);
-    box-shadow:0 0 10px var(--gc,rgba(16,185,129,.5));
-    flex-shrink:0;margin-bottom:10px;
-  }
-  .dot.pulse{animation:pulse 2s infinite}
-  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
-  .label{
-    font-family:'Rajdhani',sans-serif;font-size:9px;font-weight:700;
-    color:var(--bc,#10b981);letter-spacing:1.8px;text-transform:uppercase;
-    writing-mode:vertical-lr;transform:rotate(180deg);
-    opacity:.85;margin-bottom:14px;flex-shrink:0;
-  }
-  .time{
-    font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:700;
-    color:#fff;letter-spacing:1px;line-height:1;
-    writing-mode:vertical-lr;transform:rotate(180deg);
-    transition:color .3s;flex-shrink:0;margin-bottom:12px;
-  }
-  .time.blink{animation:blink 1s step-start infinite}
-  @keyframes blink{50%{opacity:.35}}
-  .name{
-    font-family:'Rajdhani',sans-serif;font-size:10px;font-weight:600;
-    color:rgba(255,255,255,.35);
-    writing-mode:vertical-lr;transform:rotate(180deg);
-    overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
-    max-height:120px;flex-shrink:0;margin-bottom:12px;
-  }
-  .addtime-flash{
-    font-family:'Rajdhani',sans-serif;font-size:10px;font-weight:700;
-    color:#10b981;background:rgba(16,185,129,.15);
-    border:1px solid rgba(16,185,129,.3);
-    padding:4px 6px;border-radius:12px;
-    writing-mode:vertical-lr;transform:rotate(180deg);
-    animation:flashin .4s ease;display:none;
-  }
-  @keyframes flashin{from{opacity:0;transform:rotate(180deg) scale(.8)}to{opacity:1;transform:rotate(180deg) scale(1)}}
-  .addtime-flash.show{display:block}
-  .low-warn{
-    font-family:'Rajdhani',sans-serif;font-size:9px;font-weight:700;
-    color:#ef4444;letter-spacing:.5px;
-    writing-mode:vertical-lr;transform:rotate(180deg);
-    animation:blink 1s step-start infinite;
-    margin-bottom:8px;
-  }
-  .pcid{
-    margin-top:auto;
-    font-family:'Rajdhani',sans-serif;font-size:9px;font-weight:700;
-    color:rgba(255,255,255,.12);letter-spacing:1px;flex-shrink:0;
-    writing-mode:vertical-lr;transform:rotate(180deg);
-  }
-  /* Warning state — orange glow pulse on bar bg */
-  #slider.warning .bar{
-    background:rgba(20,6,4,0.95);
-  }
-  #slider.warning .bar::after{
-    animation:warn-glow 1.4s ease-in-out infinite;
-  }
-  @keyframes warn-glow{
-    0%,100%{box-shadow:0 0 8px rgba(239,68,68,.4)}
-    50%{box-shadow:0 0 28px rgba(239,68,68,.95)}
-  }
-</style>
-</head><body>
-<div id="slider">
-  <div class="bar">
-    <button id="close-btn" title="Hide">✕</button>
-    <div id="progress" style="height:${pct}%"></div>
-    <div class="dot ${!isPaused && !isLow ? "pulse" : ""}" id="dot"></div>
-    <div class="label" id="label">${label}</div>
-    <div class="time ${isLow && !isPaused ? "blink" : ""}" id="time">${timeStr}</div>
-    <div class="name" id="name">${name}</div>
-    <div class="addtime-flash" id="flash"></div>
-    ${isLow && !isPaused ? `<div class="low-warn">ADD TIME</div>` : `<div id="lowwarn" style="display:none" class="low-warn">ADD TIME</div>`}
-    <div class="pcid">PC-0${DEVICE_ID}</div>
-  </div>
-</div>
-<script>
-  let t         = ${timeLeft};
-  let paused    = ${isPaused ? "true" : "false"};
-  let sessdur   = ${dur};
-  let serverEndTime = ${sessionEndTime || 0};   // server-anchored epoch ms
-  const WARN_AT   = ${warningAt || 300};   // low-time threshold (default 5 min)
-  const FORCE_AT  = ${WARN_SECS};          // force-show + highlight at 10 min
-  const HIDE_DELAY = 1500;                 // auto-hide after 1.5s inactivity
-
-  const slider  = document.getElementById("slider");
-  let hideTimer = null;
-
-  // ── Visibility helpers ────────────────────────────────────────────────────
-  function showBar() {
-    clearTimeout(hideTimer);
-    slider.classList.add("visible");
-    if(window.barApi) window.barApi.setMousePass(false);
-    // Always auto-hide after HIDE_DELAY regardless of cursor position
-    hideTimer = setTimeout(hideBar, HIDE_DELAY);
-  }
-  function hideBar() {
-    if(slider.classList.contains("warning")) return;
-    clearTimeout(hideTimer);
-    slider.classList.remove("visible");
-    if(window.barApi) window.barApi.setMousePass(true);
-  }
-
-  // Show on load briefly, then hide
-  showBar();
-
-  // Mouse within 5px of left edge → show bar (auto-hides after HIDE_DELAY)
-  document.addEventListener("mousemove", e => {
-    if(e.clientX <= 5 && !slider.classList.contains("visible")) {
-      showBar();
-    }
-  });
-
-  // Manual close button click
-  document.getElementById("close-btn").addEventListener("click", hideBar);
-
-  // ── State renderer ────────────────────────────────────────────────────────
-  function fmt(s){
-    if(!s||s<=0) return "00:00:00";
-    return [Math.floor(s/3600),Math.floor((s%3600)/60),s%60]
-      .map(v=>String(v).padStart(2,"0")).join(":");
-  }
-
-  function applyState(){
-    const isLow    = t > 0 && t <= WARN_AT;
-    const isWarn10 = t > 0 && t <= FORCE_AT;
-    const bc  = paused ? "#f59e0b" : (isWarn10||isLow) ? "#ef4444" : "#10b981";
-    const gc  = paused ? "rgba(245,158,11,.4)" : (isWarn10||isLow) ? "rgba(239,68,68,.6)" : "rgba(16,185,129,.4)";
-    const pct = Math.min(100, Math.max(0, (t / sessdur) * 100));
-    const lbl = paused ? "PAUSED" : isLow ? "LOW TIME" : "SESSION";
-
-    document.documentElement.style.setProperty("--bc", bc);
-    document.documentElement.style.setProperty("--gc", gc);
-    document.getElementById("progress").style.height = pct + "%";
-    document.getElementById("time").textContent = fmt(t);
-    document.getElementById("time").style.color = (isWarn10||isLow) ? "#ef4444" : paused ? "#f59e0b" : "#fff";
-    document.getElementById("time").classList.toggle("blink", (isWarn10||isLow) && !paused);
-    document.getElementById("label").textContent = lbl;
-    document.getElementById("label").style.color = bc;
-    document.getElementById("dot").style.background = bc;
-    document.getElementById("dot").style.boxShadow = "0 0 10px " + gc;
-
-    const lw = document.getElementById("lowwarn");
-    if(lw) lw.style.display = (isLow && !paused) ? "block" : "none";
-
-    // Force-show + warning glow when ≤10 min
-    if(isWarn10 && !paused){
-      slider.classList.add("warning");
-      showBar(false);            // show permanently (no auto-hide)
-      clearTimeout(hideTimer);   // cancel any pending hide
-    } else {
-      slider.classList.remove("warning");
-    }
-  }
-
-  // ── IPC from main process ─────────────────────────────────────────────────
-  let tickInterval = null; // single interval reference — prevents duplication
-
-  function startTick() {
-    if (tickInterval) return; // already running — do not create another
-    tickInterval = setInterval(() => {
-      if (!paused) {
-        // Prefer server-anchored end time for drift-free accuracy
-        if (serverEndTime > 0 && serverEndTime > Date.now()) {
-          const serverT = Math.max(0, Math.round((serverEndTime - Date.now()) / 1000));
-          // Only snap to server if within 2s to avoid visible jump from clock skew
-          if (Math.abs(serverT - t) <= 2 || t === 0) {
-            t = serverT;
-          } else if (t > 0) {
-            t--; // local decrement until next IPC update corrects it
-          }
-        } else if (t > 0) {
-          t--;
-        }
-        applyState();
-      }
-    }, 1000);
-  }
-
-  function stopTick() {
-    if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
-  }
-
-  if(window.barApi) {
-    window.barApi.onUpdate(data => {
-      const prevT   = t;
-      const diff    = data.timeLeft - t;
-
-      // Update server-anchored end time whenever we get a new value
-      if (data.sessionEndTime) serverEndTime = data.sessionEndTime;
-
-      // Only hard-reset the local counter on significant external changes (add/reduce time)
-      // Small drifts (<= 8s) are ignored to prevent flickering
-      if(Math.abs(diff) > 8) t = data.timeLeft;
-
-      paused  = data.isPaused;
-      sessdur = data.sessionDuration || sessdur;
-      if(data.customerName !== undefined)
-        document.getElementById("name").textContent = data.customerName;
-
-      // Flash "+Xmin" / "-Xmin" badge on significant time changes
-      if(Math.abs(diff) > 30) {
-        const flash = document.getElementById("flash");
-        flash.textContent = diff > 0 ? "+" + Math.round(diff/60) + "m ✓" : Math.round(diff/60) + "m";
-        flash.style.color       = diff > 0 ? "#10b981" : "#ef4444";
-        flash.style.borderColor = diff > 0 ? "rgba(16,185,129,.3)" : "rgba(239,68,68,.3)";
-        flash.style.background  = diff > 0 ? "rgba(16,185,129,.12)" : "rgba(239,68,68,.12)";
-        flash.classList.add("show");
-        showBar(true);
-        setTimeout(() => flash.classList.remove("show"), 2500);
-      }
-
-      // Manage single tick interval based on pause state
-      if (paused) { stopTick(); } else { startTick(); }
-      applyState();
-    });
-  }
-
-  // Start ticking on load
-  startTick();
-  applyState();
-</script>
-</body></html>`;
-}
-
-// Create or update the countdown bar
-function showCountdownBar(timeLeft, isPaused, customerName, sessionDuration) {
-  const d = getDisplay();
-  const warningAt = settings.warningAt || 300;
-
-  if (countdownBar && !countdownBar.isDestroyed()) {
-    // Send an update to the bar every poll cycle.
-    // TIMER FREEZE FIX: Firebase only writes back every 10s, so polling every
-    // 1.5s returns a stale time_remaining — especially under 5 minutes.
-    // We pass the Firebase value BUT the renderer only replaces its local
-    // countdown `t` when the difference is > 5 seconds (external add/reduce).
-    // All other polls just update pause/name/colors without resetting the clock.
-    countdownBar.webContents.send("update", {
-      timeLeft, isPaused, customerName, sessionDuration, warningAt,
-      sessionEndTime: currentPCData?.session_end_time || 0,
-    });
-    return;
-  }
-
-  // Guard against a second call while the first BrowserWindow is still being
-  // constructed (e.g. whenReady creates the bar, then the first pollStatus
-  // fires 1.5s later before webContents is ready — without this guard a second
-  // window would be built because countdownBar.isDestroyed() hasn't settled).
-  if (barCreating) return;
-  barCreating = true;
-
-  // Build and show fresh bar
-  const html = buildCountdownBarHTML(timeLeft, isPaused, customerName, sessionDuration, warningAt, currentPCData?.session_end_time || 0);
-
-  countdownBar = new BrowserWindow({
-    width:       BAR_WIDTH_OPEN,   // wide enough for the expanded panel
-    height:      d.h,              // full-screen height, left edge
-    x:           d.x,              // flush to left edge
-    y:           d.y,
-    frame:       false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable:   false,
-    movable:     false,
-    focusable:   false,            // never steals focus
-    hasShadow:   false,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: path.join(__dirname, "bar-preload.js"),
-    },
-  });
-
-  // Start fully transparent to mouse — the bar is visually hidden (slid off-screen)
-  // on load. The renderer sends IPC "bar-mouse-pass" to toggle hit-testing:
-  //   pass=true  → window is click-through (bar is collapsed / hidden)
-  //   pass=false → window accepts clicks (bar is expanded / visible)
-  // forward:true ensures OS mouse events still reach windows underneath while passing.
-  countdownBar.setIgnoreMouseEvents(true, { forward: true });
-
-  // Listen for the renderer's visibility signal and toggle hit-testing accordingly.
-  // Remove any old listener first to avoid duplicates across re-creations.
-  ipcMain.removeAllListeners("bar-mouse-pass");
-  ipcMain.on("bar-mouse-pass", (_, pass) => {
-    if (countdownBar && !countdownBar.isDestroyed()) {
-      countdownBar.setIgnoreMouseEvents(pass, { forward: true });
-    }
-    // Reserve 0px when bar is fully hidden so desktop is completely unobstructed;
-    // expand to 200px only while the bar is open and in use.
-    reserveLeftEdge(pass ? 0 : BAR_WIDTH_OPEN);
-  });
-
-  countdownBar.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-  keepOnTop(countdownBar);
-
-  // Release the creation guard once the window has actually loaded so that
-  // any subsequent showCountdownBar() call can safely send IPC updates instead.
-  // Also reserve the left edge now that the bar is visible.
-  countdownBar.webContents.once("did-finish-load", () => {
-    barCreating = false;
-    // Bar starts completely hidden — reserve 0px so full screen is usable.
-    // It expands to 200px via IPC only when the bar slides open.
-    reserveLeftEdge(0);
-  });
-
-  setInterval(() => {
-    if (countdownBar && !countdownBar.isDestroyed()) keepOnTop(countdownBar);
-  }, 2000);
-}
-
-function hideCountdownBar() {
-  barCreating = false;   // reset guard in case bar is torn down before load completes
-  destroyWin(countdownBar);
-  countdownBar = null;
-  restoreWorkArea();
-}
-
 // ── Screensaver ───────────────────────────────────────────────────────────────
 const BASE_CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&display=swap');
@@ -556,7 +139,6 @@ body{background:var(--bg);color:#fff;font-family:'Rajdhani',sans-serif;overflow:
 
 function showScreensaver() {
   if (screensaverWin && !screensaverWin.isDestroyed()) return;
-  hideCountdownBar();
 
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
@@ -675,54 +257,168 @@ setInterval(()=>{if(s>0){s--;document.getElementById("t").textContent=fmt(s);}},
 }
 function destroyWarning() { destroyWin(warningWin); warningWin = null; }
 
-// ── Shutdown overlay ──────────────────────────────────────────────────────────
-function showShutdownWindow(pc) {
-  if (shutdownWin && !shutdownWin.isDestroyed()) return;
-  destroyWarning();
-  hideCountdownBar();
+// ── Countdown Overlay — bottom-right white timer ──────────────────────────────
+let countdownOverlay = null;
 
-  const delay = settings.shutdownDelay || 30;
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+function buildCountdownOverlayHTML(timeLeft, isPaused, sessionEndTime = 0) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
-${BASE_CSS}
-body{background:rgba(4,4,12,.98)}
-.wrap{text-align:center;padding:50px}
-.icon{font-size:64px;margin-bottom:16px}
-.title{font-family:'Orbitron',monospace;font-size:28px;font-weight:900;color:#3b82f6;margin-bottom:8px}
-.sub{font-size:16px;color:rgba(255,255,255,.4);margin-bottom:24px}
-.count{font-family:'Orbitron',monospace;font-size:56px;font-weight:900;color:#ef4444;text-shadow:0 0 30px rgba(239,68,68,.6)}
-.label{font-size:13px;color:rgba(255,255,255,.22);margin-top:8px;letter-spacing:1px}
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:transparent;overflow:hidden;
+  -webkit-app-region:no-drag;user-select:none;
+  display:flex;align-items:flex-end;justify-content:flex-end;}
+#wrap{padding:14px 20px;display:flex;flex-direction:column;align-items:flex-end;gap:4px;}
+#label{font-family:'Orbitron',monospace;font-size:11px;font-weight:700;
+  letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.28);transition:color .4s;}
+#timer{font-family:'Share Tech Mono',monospace;font-size:52px;font-weight:700;
+  color:rgba(255,255,255,0.85);text-shadow:0 0 30px rgba(255,255,255,0.15);
+  line-height:1;letter-spacing:2px;transition:color .4s,text-shadow .4s;}
+#timer.low{color:#ef4444!important;
+  text-shadow:0 0 20px rgba(239,68,68,0.7),0 0 60px rgba(239,68,68,0.3)!important;
+  animation:pulse 1s ease-in-out infinite;}
+#timer.paused{color:rgba(245,158,11,0.8)!important;
+  text-shadow:0 0 20px rgba(245,158,11,0.4)!important;animation:none;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.55}}
+#dots{display:flex;gap:5px;margin-top:2px;}
+.dot{width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,0.18);}
+.dot.on{background:rgba(255,255,255,0.6)}.dot.red{background:#ef4444}
 </style></head><body>
-<div class="wrap">
-  <div class="icon">⏻</div>
-  <div class="title">SESSION ENDED</div>
-  <div class="sub">${pc.customer_name ? `Thanks for playing, ${pc.customer_name}!` : "Thanks for playing!"}</div>
-  <div class="count" id="c">${delay}</div>
-  <div class="label">SHUTTING DOWN IN SECONDS</div>
+<div id="wrap">
+  <div id="label">TIME LEFT</div>
+  <div id="timer">--:--:--</div>
+  <div id="dots"><div class="dot" id="d0"></div><div class="dot" id="d1"></div><div class="dot" id="d2"></div></div>
 </div>
 <script>
-let s=${delay};
-const el=document.getElementById("c");
-const iv=setInterval(()=>{s--;el.textContent=s;if(s<=0)clearInterval(iv);},1000);
-</script>
-</body></html>`;
+let paused=${isPaused?"true":"false"};
+let serverEnd=${sessionEndTime||0};
+let fallback=${timeLeft};
+let serverOffset=${_serverOffset||0};  // clock skew correction
+const LOW=120;
+const timerEl=document.getElementById("timer");
+const labelEl=document.getElementById("label");
+const dots=[document.getElementById("d0"),document.getElementById("d1"),document.getElementById("d2")];
+let dot=0;
+function sNow(){return Date.now()+serverOffset;}
+function calcT(){
+  if(serverEnd>0&&serverEnd>sNow()){
+    const epochT=Math.round((serverEnd-sNow())/1000);
+    // Trust epoch only if within 5 min of Firebase time_remaining
+    if(Math.abs(epochT-fallback)<300)return Math.max(0,epochT);
+  }
+  return Math.max(0,fallback);
+}
+function fmt(s){if(!s||s<=0)return"00:00:00";return[Math.floor(s/3600),Math.floor((s%3600)/60),s%60].map(v=>String(v).padStart(2,"0")).join(":");}
+function tick(){
+  const t=calcT();const low=t>0&&t<=LOW;
+  timerEl.textContent=fmt(t);
+  timerEl.className=paused?"paused":low?"low":"";
+  labelEl.textContent=paused?"PAUSED":low?"⚠ 2 MIN LEFT":"TIME LEFT";
+  labelEl.style.color=paused?"rgba(245,158,11,0.5)":low?"rgba(239,68,68,0.6)":"rgba(255,255,255,0.28)";
+  dot=(dot+1)%3;dots.forEach((d,i)=>{d.className="dot"+(i===dot?(low?" red":" on"):"");});
+}
+if(window.barApi){
+  window.barApi.onUpdate(data=>{
+    if(data.sessionEndTime)serverEnd=data.sessionEndTime;
+    if(data.serverOffset!==undefined)serverOffset=data.serverOffset;
+    fallback=data.timeLeft;paused=data.isPaused;
+    tick();
+  });
+}
+setInterval(()=>{if(!paused){fallback=Math.max(0,fallback-1);tick();}},1000);
+tick();
+</script></body></html>`;
+}
+
+function showCountdownOverlay(timeLeft, isPaused, sessionEndTime = 0) {
+  if (countdownOverlay && !countdownOverlay.isDestroyed()) {
+    countdownOverlay.webContents.send("update", {
+      timeLeft, isPaused, sessionEndTime: sessionEndTime || 0,
+      sessionDuration: 0, customerName: "", warningAt: 120,
+    });
+    return;
+  }
+  const d = getDisplay();
+  const W = 340, H = 120;
+  countdownOverlay = new BrowserWindow({
+    width: W, height: H,
+    x: d.x + d.w - W,
+    y: d.y + d.h - H - 48,
+    frame: false, transparent: true,
+    alwaysOnTop: true, skipTaskbar: true,
+    resizable: false, movable: false,
+    focusable: false, hasShadow: false,
+    webPreferences: {
+      nodeIntegration: false, contextIsolation: true,
+      preload: path.join(__dirname, "bar-preload.js"),
+    },
+  });
+  countdownOverlay.setIgnoreMouseEvents(true, { forward: true });
+  countdownOverlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildCountdownOverlayHTML(timeLeft, isPaused, sessionEndTime))}`);
+  keepOnTop(countdownOverlay);
+  setInterval(() => { if (countdownOverlay && !countdownOverlay.isDestroyed()) keepOnTop(countdownOverlay); }, 2000);
+}
+
+function hideCountdownOverlay() {
+  if (countdownOverlay && !countdownOverlay.isDestroyed()) countdownOverlay.close();
+  countdownOverlay = null;
+}
+
+// ── Session Over overlay (Mario Gaming — no white flash, no countdown) ────────
+// Called when manager ends session manually. Just shows the overlay, NO shutdown.
+// Actual shutdown is ONLY triggered by timer expiry in pollStatus.
+function showSessionOver(pc) {
+  if (shutdownWin && !shutdownWin.isDestroyed()) return;
+  destroyWarning();
+  hideCountdownOverlay();
+
+  const customerName = pc.customer_name || "";
+  const marioHtml = () => `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+${BASE_CSS}
+body{background:rgba(4,4,12,.98);animation:fadein .5s ease}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.wrap{text-align:center;padding:60px 40px}
+.logo{font-size:80px;margin-bottom:20px;animation:float 2.5s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-14px)}}
+.title{font-family:'Orbitron',monospace;font-size:44px;font-weight:900;
+  background:linear-gradient(135deg,#ef4444,#f59e0b);-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;margin-bottom:8px}
+.cafe{font-family:'Rajdhani',sans-serif;font-size:22px;color:rgba(255,255,255,.38);
+  letter-spacing:3px;margin-bottom:28px}
+.name{font-family:'Orbitron',monospace;font-size:28px;font-weight:700;color:#10b981;
+  text-shadow:0 0 24px rgba(16,185,129,.6);margin-bottom:12px}
+.ty{font-size:17px;color:rgba(255,255,255,.28);letter-spacing:.5px}
+canvas{position:fixed;inset:0;pointer-events:none;z-index:-1}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="wrap">
+  <div class="logo">🎮</div>
+  <div class="title">SESSION OVER</div>
+  <div class="cafe">MARIO GAMING CAFÉ</div>
+  ${customerName ? `<div class="name">${customerName.toUpperCase()}</div>` : ""}
+  <div class="ty">Thanks for playing! See you again 👋</div>
+</div>
+<script>
+const c=document.getElementById("c"),ctx=c.getContext("2d");
+c.width=window.innerWidth;c.height=window.innerHeight;
+const stars=Array.from({length:150},()=>({x:Math.random()*c.width,y:Math.random()*c.height,r:Math.random()*1.6+.3,o:Math.random(),s:Math.random()*.004+.001}));
+function draw(){ctx.clearRect(0,0,c.width,c.height);stars.forEach(s=>{s.o+=s.s;if(s.o>1||s.o<0)s.s*=-1;ctx.globalAlpha=s.o;ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,Math.PI*2);ctx.fill();});ctx.globalAlpha=1;requestAnimationFrame(draw);}
+draw();
+</script></body></html>`;
 
   shutdownWin = makeFullWin({ focusable: false });
-  shutdownWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  shutdownWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(marioHtml())}`);
   shutdownWin.on("close", e => e.preventDefault());
   keepOnTop(shutdownWin);
-
-  if (delay > 0) {
-    let count = delay;
-    shutdownTicker = setInterval(() => {
-      count--;
-      if (count <= 0) {
-        clearInterval(shutdownTicker); shutdownTicker = null;
-        try { require("child_process").execSync("shutdown /s /t 0"); } catch(e) {}
-      }
-    }, 1000);
-  }
+  // Refresh every 3s so star animation stays alive
+  setInterval(() => {
+    if (shutdownWin && !shutdownWin.isDestroyed()) keepOnTop(shutdownWin);
+  }, 2000);
 }
+
+// Alias for legacy calls — shows overlay only, no shutdown
+function showShutdownWindow(pc) { showSessionOver(pc); }
 
 // ── Register ──────────────────────────────────────────────────────────────────
 async function register() {
@@ -778,12 +474,8 @@ async function pollStatus() {
   // ── Active session ─────────────────────────────────────────────────────────
   if (status === "active" && timeLeft > 0) {
     hideScreensaver();
-
-    // KEY FIX: always call showCountdownBar with the latest Firebase values.
-    // If the bar already exists, this sends an IPC update with the corrected
-    // time_remaining — so add/reduce time instantly shows on the bar.
-    showCountdownBar(timeLeft, isPaused, pc.customer_name, sessDur);
-
+    // Update countdown overlay (bottom-right white timer)
+    showCountdownOverlay(timeLeft, isPaused, pc.session_end_time || 0);
     // Dismiss warning if time was extended
     if (warningShown && timeLeft > WARNING_AT) {
       warningShown = false;
@@ -792,7 +484,9 @@ async function pollStatus() {
   }
 
   // ── Idle / Offline ─────────────────────────────────────────────────────────
-  if ((status === "online" || status === "offline") && lastStatus !== null && lastStatus !== "active") {
+  // Don't show screensaver if the session-over overlay is active
+  const sessionOverShowing = shutdownWin && !shutdownWin.isDestroyed();
+  if ((status === "online" || status === "offline") && lastStatus !== null && lastStatus !== "active" && !sessionOverShowing) {
     if (!screensaverWin || screensaverWin.isDestroyed()) {
       setTimeout(() => showScreensaver(), 600);
     }
@@ -804,26 +498,37 @@ async function pollStatus() {
     showWarningWindow(timeLeft);
   }
 
-  // ── Session ended by manager ────────────────────────────────────────────────
-  if (lastStatus === "active" && status !== "active") {
-    hideCountdownBar();
-    showShutdownWindow(pc);
+  const endedByManager = pc.ended_by === "manager";
+
+  // ── Session ended by manager — show overlay, NO shutdown ─────────────────
+  if (lastStatus === "active" && status !== "active" && !shutdownFired && endedByManager) {
+    hideCountdownOverlay();
+    showSessionOver(pc);
+    lastStatus = status; lastTimeLeft = timeLeft;
+    return;
   }
 
-  // ── Timer expired ───────────────────────────────────────────────────────────
-  if (status === "active" && !isPaused && timeLeft <= 0 && lastTimeLeft > 0) {
-    hideCountdownBar();
+  // ── Timer expired — show overlay AND shutdown ─────────────────────────────
+    if (timerExpired) {
+    shutdownFired = true;
+    hideCountdownOverlay();
     const saved = { ...pc };
     await fbPatch(`pcs/${DEVICE_ID}`, {
       status: "online", time_remaining: 0,
-      session_start: null, is_paused: false, customer_name: "",
+      session_start: null, session_end_time: null,
+      is_paused: false, customer_name: "",
     });
-    showShutdownWindow(saved);
+    showSessionOver(saved); // Mario overlay
+    // Silently shutdown after delay — no extra overlay, no flash
+    const delay = settings.shutdownDelay || 30;
+    setTimeout(() => {
+      try { require("child_process").execSync("shutdown /s /t 0"); } catch(e) {}
+    }, delay * 1000);
   }
 
   // ── New session started ─────────────────────────────────────────────────────
   if (status === "active" && timeLeft > 0 && lastStatus !== "active") {
-    warningShown = false; lastShutdownCmd = null;
+    warningShown = false; lastShutdownCmd = null; shutdownFired = false;
     destroyWarning();
     destroyWin(shutdownWin); shutdownWin = null;
     if (shutdownTicker) { clearInterval(shutdownTicker); shutdownTicker = null; }
@@ -860,6 +565,7 @@ app.whenReady().then(async () => {
   }
 
   setupTray();
+  startServerOffsetSync(); // sync clock offset with Firebase server immediately
 
   // ── Show screensaver IMMEDIATELY — no blank screen while Firebase loads ────
   // The screensaver is shown first so the customer always sees the lock screen
@@ -876,11 +582,10 @@ app.whenReady().then(async () => {
   const initPc = await fbGet(`pcs/${DEVICE_ID}`);
   if (initPc && initPc.status === "active") {
     hideScreensaver();
-    showCountdownBar(
+    showCountdownOverlay(
       Math.floor(initPc.time_remaining || 0),
       !!initPc.is_paused,
-      initPc.customer_name,
-      initPc.session_duration,
+      initPc.session_end_time || 0,
     );
   }
 
@@ -896,5 +601,4 @@ app.on("window-all-closed", () => { /* intentionally empty — do not quit */ })
 // update signals, etc.).  Only allow quit when WE set isQuitting = true first.
 app.on("before-quit", e => {
   if (!isQuitting) { e.preventDefault(); return; }
-  restoreWorkArea();  // always give the screen back before exiting
 });

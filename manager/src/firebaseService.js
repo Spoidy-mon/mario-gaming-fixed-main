@@ -1,6 +1,19 @@
 import { db } from "./firebase";
 import { ref, set, update, get, push, onValue, remove, runTransaction } from "firebase/database";
 
+// ── Server time offset ────────────────────────────────────────────────────────
+// Firebase .info/serverTimeOffset gives (Firebase server ms) - (local ms).
+// Using serverNow() instead of Date.now() eliminates clock skew between devices.
+let _serverTimeOffset = 0;
+export function listenServerTimeOffset() {
+  return onValue(ref(db, ".info/serverTimeOffset"), snap => {
+    _serverTimeOffset = snap.val() || 0;
+  });
+}
+export function serverNow() {
+  return Date.now() + _serverTimeOffset;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPER
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +62,7 @@ export function listenPCs(callback) {
 
 // Quick-start: just name, no payment yet → payment_status = "pending"
 export async function quickStartSession(pcId, customerName, durationMinutes = 60, settings = {}) {
-  const sessionStart   = Date.now();
+  const sessionStart   = serverNow();
   const durationSec    = (durationMinutes || 60) * 60;
   // Calculate price from duration so dues shows correct amount immediately
   const sessionPrice   = priceForSeconds(durationSec, settings?.pricing);
@@ -105,7 +118,7 @@ export async function quickStartSession(pcId, customerName, durationMinutes = 60
 
 // Full start with payment
 export async function startSession(pcId, durationSeconds, customer, paymentInfo, freeMinutes = 0, shutdownDelay = null) {
-  const sessionStart = Date.now();
+  const sessionStart = serverNow();
   const info = typeof customer === "string"
     ? { name: customer, phone: "", address: "" }
     : customer || {};
@@ -195,7 +208,7 @@ export async function updateSessionDetails(pcId, details, settings) {
   // Preserving timer_started_at keeps the countdown running uninterrupted.
   const prevTotalSec = (pc.session_duration || 0);
   const timerAnchorUpdate = (totalSec !== prevTotalSec)
-    ? { timer_started_at: Date.now() }
+    ? { timer_started_at: serverNow() }
     : {};
 
   await update(ref(db, `pcs/${pcId}`), {
@@ -435,6 +448,8 @@ export async function endSession(pcId, pcs) {
     extra_charges: 0, base_price: 0, total_charge: 0, balance_due: 0,
     timer_started_at: null, paused_at: null,
     shutdown_command: null, welcome_overlay: null,
+    ended_by: "manager",   // tells client: don't auto-shutdown
+    session_end_time: null,
   });
 }
 
@@ -506,7 +521,7 @@ export function listenPS5Sessions(callback) {
 }
 
 export async function ps5QuickStart(ps5Id, customerName, durationMinutes = 60, settings = {}) {
-  const sessionStart = Date.now();
+  const sessionStart = serverNow();
   const durationSec  = (durationMinutes || 60) * 60;
   const sessionPrice = priceForSeconds(durationSec, settings?.pricing);
   await update(ref(db, `ps5_sessions/${ps5Id}`), {
@@ -527,7 +542,7 @@ export async function ps5QuickStart(ps5Id, customerName, durationMinutes = 60, s
 }
 
 export async function ps5StartSession(ps5Id, durationSeconds, customer, paymentInfo, freeMinutes = 0) {
-  const sessionStart = Date.now();
+  const sessionStart = serverNow();
   const info = typeof customer === "string" ? { name: customer } : customer || {};
   const totalSeconds = durationSeconds + (freeMinutes * 60);
   const cashAmt  = paymentInfo?.cash  ?? (paymentInfo?.mode === "cash" ? paymentInfo?.amount || 0 : 0);
@@ -900,36 +915,56 @@ export async function addPendingDue(due) {
   await push(ref(db, "pending_dues"), { ...due, paid: false, created_at: Date.now() });
 }
 export async function markDuePaid(key, paidInfo) {
-  const now = Date.now();
-  await update(ref(db, `pending_dues/${key}`), {
-    paid: true, paid_at: now, paid_mode: paidInfo.mode || "cash", ...paidInfo,
-  });
-  // Correctly route cash vs UPI to the right ledger
-  const mode     = paidInfo.mode || "cash";
-  const dueAmt   = Number(paidInfo.amount || 0);
-  const cashPaid = mode === "cash"  ? dueAmt
-                 : mode === "split" ? Number(paidInfo.cash_amount || 0)
-                 : 0;
-  const upiPaid  = mode === "upi"   ? dueAmt
-                 : mode === "split" ? Number(paidInfo.upi_amount  || 0)
-                 : 0;
+  const now        = serverNow();
+  const mode       = paidInfo.mode || "cash";
+  const dueAmt     = Number(paidInfo.amount || 0);
+  const paidAmt    = Number(paidInfo.paid_amount || dueAmt); // actual amount received
+  const remaining  = Number(paidInfo.remaining || 0);
+  const fullyPaid  = paidInfo.fully_paid !== false && remaining <= 0;
+
+  const cashPaid   = mode === "cash"  ? paidAmt
+                   : mode === "split" ? Number(paidInfo.cash_amount || 0)
+                   : 0;
+  const upiPaid    = mode === "upi"   ? paidAmt
+                   : mode === "split" ? Number(paidInfo.upi_amount  || 0)
+                   : 0;
+
+  if (fullyPaid) {
+    // Mark fully paid
+    await update(ref(db, `pending_dues/${key}`), {
+      paid: true, paid_at: now, paid_mode: mode,
+      amount: 0, paid_amount: paidAmt,
+    });
+  } else {
+    // Partial — update remaining amount, keep due open
+    await update(ref(db, `pending_dues/${key}`), {
+      paid: false,
+      amount: remaining,
+      amount_original: dueAmt,
+      paid_amount: (paidInfo.prev_paid || 0) + paidAmt,
+      last_paid_at: now, last_paid_mode: mode,
+      reason: (paidInfo.reason || "") + ` [₹${paidAmt} collected ${new Date(now).toLocaleDateString("en-IN")}]`,
+    });
+  }
+
+  // Add to cash/UPI ledger
   if (cashPaid > 0) await addToCashBalance(cashPaid, `due collected key:${key}`);
   if (upiPaid  > 0) await addToUpiBalance(upiPaid,   `due collected key:${key}`);
 
-  // BUG FIX: write to payments so Sales tab reflects collected dues
+  // Log to payments for Sales tab
   const dueSnap = await get(ref(db, `pending_dues/${key}`));
   const due = dueSnap.val() || {};
-  if (dueAmt > 0) {
+  if (paidAmt > 0) {
     await push(ref(db, "payments"), {
       pc_id: due.pc_id || null,
       pc_name: due.pc_name || due.ps5_name || "General",
       device_type: due.device_type || "pc",
       customer_name: due.customer_name || "",
-      amount: dueAmt,
+      amount: paidAmt,
       cash: cashPaid, upi: upiPaid,
       cash_amount: cashPaid, upi_amount: upiPaid,
       mode,
-      reason: due.reason || "Due collected",
+      reason: `${due.reason || "Due collected"}${!fullyPaid ? ` (partial — ₹${remaining} remaining)` : ""}`,
       paid_at: now,
     });
   }
@@ -961,7 +996,7 @@ export function listenConsoles(callback) {
   return onValue(ref(db, "consoles"), (snap) => callback(snap.val() || {}));
 }
 export async function checkAndRecoverStaleSessions(pcs) {
-  const now = Date.now();
+  const now = serverNow();
   for (const pc of pcs) {
     if (pc.status === "active" && !pc.is_paused) {
       const lastBeat = pc.timer_started_at || 0;
@@ -1002,7 +1037,7 @@ export async function transferToBank(amount, who, reason) {
 
   const newCash = current.cash_balance - amt;
   const newBank = current.bank_balance + amt;
-  const now     = Date.now();
+  const now     = serverNow();
 
   // Update balances atomically
   await update(ref(db, "cash_ledger"), {
@@ -1045,7 +1080,7 @@ export async function withdrawCash(amount, who, reason) {
   }
 
   const newCash = current.cash_balance - amt;
-  const now     = Date.now();
+  const now     = serverNow();
 
   await update(ref(db, "cash_ledger"), {
     cash_balance: newCash,
@@ -1116,7 +1151,7 @@ export async function returnToCounter(amount, who, reason) {
 
   const newCash = current.cash_balance + amt;
   const newBank = current.bank_balance - amt;
-  const now     = Date.now();
+  const now     = serverNow();
 
   await update(ref(db, "cash_ledger"), {
     cash_balance: newCash,
@@ -1353,4 +1388,83 @@ export async function clearAllTransactionalData() {
     resetAllPS5Sessions(),
     set(ref(db, "cash_ledger"), { cash_balance: 0, bank_balance: 0, last_updated: Date.now() }),
   ]);
+}
+// ── Gift Time ────────────────────────────────────────────────────────────────
+export async function giftTime(devType, devId, giftSeconds = 300) {
+  const path = devType === "ps5" ? `ps5_sessions/${devId}` : `pcs/${devId}`;
+  const snap = await get(ref(db, path));
+  const dev  = snap.val();
+  if (!dev) throw new Error("Device not found");
+  if (dev.status !== "active") throw new Error("No active session");
+  const remaining = dev.gift_uses_remaining ?? 2;
+  if (remaining <= 0) throw new Error("Gift time already used up (2/2 this session)");
+  const now        = serverNow();
+  const newTime    = (dev.time_remaining || 0) + giftSeconds;
+  const newEndTime = dev.session_end_time
+    ? dev.session_end_time + (giftSeconds * 1000)
+    : now + (newTime * 1000);
+  await update(ref(db, path), {
+    time_remaining:      newTime,
+    session_end_time:    newEndTime,
+    session_duration:    (dev.session_duration || 0) + giftSeconds,
+    gift_uses_remaining: remaining - 1,
+  });
+  return remaining - 1;
+}
+
+// ── Canteen Item Management ───────────────────────────────────────────────────
+export async function addCanteenItem({ name, price, category, emoji, stock = 0 }) {
+  const id = Date.now();
+  await set(ref(db, `canteen_items/${id}`), {
+    id, name: name.trim(), price: Number(price), category: category || "snack",
+    emoji: emoji || "🍫", stock: Number(stock), created_at: id,
+  });
+  return id;
+}
+
+export async function repriceItem(itemId, newPrice) {
+  await update(ref(db, `canteen_items/${itemId}`), { price: Number(newPrice) });
+}
+
+export async function resetAllStock(items, newStock = 0) {
+  const updates = {};
+  items.forEach(item => { updates[`canteen_items/${item.id}/stock`] = Number(newStock); });
+  await update(ref(db), updates);
+}
+
+export async function deleteCanteenItem(itemId) {
+  await remove(ref(db, `canteen_items/${itemId}`));
+}
+
+// ── Delete Functions ──────────────────────────────────────────────────────────
+export async function deleteSessionHistory(key) {
+  await remove(ref(db, `session_history/${key}`));
+}
+
+export async function deleteDue(key) {
+  await remove(ref(db, `pending_dues/${key}`));
+}
+
+export async function deleteEntry(type, key) {
+  const pathMap = { gaming: "payments", canteen: "sales", withdrawal: "withdrawals" };
+  const path = pathMap[type];
+  if (!path || !key) throw new Error("Invalid entry");
+  await remove(ref(db, `${path}/${key}`));
+}
+
+// ── Cafe Share & Monthly Reports ──────────────────────────────────────────────
+export async function setCafeShareStatus(monthKey, status) {
+  await update(ref(db, `cafe_share/${monthKey}`), { status, updated_at: Date.now() });
+}
+
+export async function setCafeShareAmount(monthKey, amount) {
+  await update(ref(db, `cafe_share/${monthKey}`), { amount: Number(amount), updated_at: Date.now() });
+}
+
+export async function recordMonthlySnapshot(monthKey, data) {
+  await set(ref(db, `monthly_reports/${monthKey}`), { ...data, created_at: Date.now() });
+}
+
+export function getMonthKey(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`;
 }

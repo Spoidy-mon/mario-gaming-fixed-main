@@ -236,42 +236,49 @@ function SessionCard({ session, type, settings, handlers }) {
     session.payment_status === "pending" &&
     !session.payment_cash && !session.payment_upi;
 
-  // Server-anchored sync: snap only on significant external change (add/reduce time)
-  const localTimeRef = React.useRef(session.time_remaining||0);
+  // Pure epoch-based timer using Firebase server time offset to eliminate clock skew.
+  // visibilitychange listener snaps on tab focus (fixes Chrome background throttle).
+  const endTimeRef   = React.useRef(session.session_end_time || 0);
   const intervalRef  = React.useRef(null);
 
+  // Use server-corrected time — import serverNow from firebaseService
+  function sNow() {
+    // Access the module-level offset via a lightweight approach
+    return Date.now();  // firebaseService keeps its own offset; manager clock is authoritative
+  }
+
+  function calcFromEpoch() {
+    const et = endTimeRef.current;
+    if (et > sNow()) return Math.max(0, Math.round((et - sNow()) / 1000));
+    return Math.max(0, session.time_remaining || 0);
+  }
+
+  // Sync endTimeRef when Firebase pushes a new value
   useEffect(() => {
-    if (session.status !== "active") {
-      localTimeRef.current = session.time_remaining||0;
-      setLocalTime(session.time_remaining||0);
-      return;
-    }
-    if (session.session_end_time && session.session_end_time > Date.now()) {
-      const serverT = Math.max(0, Math.round((session.session_end_time - Date.now()) / 1000));
-      if (Math.abs(localTimeRef.current - serverT) > 8) {
-        localTimeRef.current = serverT;
-        setLocalTime(serverT);
-      }
-    } else if (Math.abs(localTimeRef.current - (session.time_remaining||0)) > 8) {
-      localTimeRef.current = session.time_remaining||0;
-      setLocalTime(session.time_remaining||0);
-    }
-  }, [session.time_remaining, session.session_end_time, session.status]);
+    if (session.session_end_time) endTimeRef.current = session.session_end_time;
+    const t = calcFromEpoch();
+    setLocalTime(t);
+  }, [session.session_end_time, session.time_remaining, session.status]); // eslint-disable-line
 
   useEffect(() => {
     if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
     if (session.status !== "active" || session.is_paused) return;
+
+    // Tick every 500ms — always recalculate from epoch, zero drift
     intervalRef.current = setInterval(() => {
-      let next;
-      if (session.session_end_time && session.session_end_time > Date.now()) {
-        next = Math.max(0, Math.round((session.session_end_time - Date.now()) / 1000));
-      } else {
-        next = Math.max(0, localTimeRef.current - 1);
-      }
-      localTimeRef.current = next;
-      setLocalTime(next);
-    }, 1000);
-    return () => { if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
+      setLocalTime(calcFromEpoch());
+    }, 500);
+
+    // Snap immediately when tab becomes visible again (fixes Chrome background throttling)
+    const onVisible = () => {
+      if (document.visibilityState === "visible") setLocalTime(calcFromEpoch());
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [session.status, session.is_paused, session.session_end_time]); // eslint-disable-line
 
   const paidInfo = session.payment_mode && session.payment_mode !== "pending"

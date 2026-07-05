@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
 import { returnItem } from "../firebaseService";
 import { announceItemReturned } from "../utils/speak";
 import { toast } from "react-toastify";
@@ -109,38 +109,50 @@ function RestockModal({ item, onClose, onRestock }) {
   );
 }
 
-// ── Sell Modal — PC + PS5 device selector ─────────────────────────────────────
+// ── Sell Modal — redesigned with CollectModal-style payment UI ────────────────
 function SellModal({ item, pcs, ps5Sessions, onClose, onSell }) {
-  const [selId,      setSelId]      = useState(null);
-  const [selType,    setSelType]    = useState("pc");
-  const [filter,     setFilter]     = useState("all"); // all | pc | ps5
-  const [payMode,    setPayMode]    = useState("cash"); // cash | upi
+  const [selId,    setSelId]    = useState(null);
+  const [selType,  setSelType]  = useState("pc");
+  const [filter,   setFilter]   = useState("all");
+  const [payMode,  setPayMode]  = useState("cash"); // cash | upi | charge | split
+  const [cashAmt,  setCashAmt]  = useState("");
+  const [upiAmt,   setUpiAmt]   = useState("");
+
+  const price    = item.price * 1;
+  const cashNum  = Number(cashAmt || 0);
+  const upiNum   = Number(upiAmt  || 0);
+  const totalPaid = payMode === "split" ? cashNum + upiNum : price;
+  const dueAmt   = Math.max(0, price - totalPaid);
+  const overpaid = totalPaid > price;
 
   const activePCs  = pcs.filter(p => p.status !== "offline");
   const activePS5s = (ps5Sessions||[]).filter(s => s.status !== "offline");
 
-  const handleSell = () => { onSell(item.id, 1, selId, payMode); onClose(); };
-
-  // Preview badge
   const preview = selId !== null && (() => {
     if (selType === "ps5") {
       const s = (ps5Sessions||[]).find(x => x.id === selId);
       return `🎮 PS5 #${selId}${s?.customer_name ? ` · ${s.customer_name}` : ""}`;
     }
     const pc = pcs.find(p => p.id === selId);
-    return pc?.customer_name
-      ? `👤 ${pc.customer_name} on ${pc.name}`
-      : `🖥 ${pc?.name}`;
+    return pc?.customer_name ? `👤 ${pc.customer_name} on ${pc.name}` : `🖥 ${pc?.name}`;
   })();
 
   const showPCs  = filter === "all" || filter === "pc";
   const showPS5s = filter === "all" || filter === "ps5";
 
+  const handleSell = () => {
+    const splitData = payMode === "split" ? { cash: cashNum, upi: upiNum } : undefined;
+    onSell(item.id, 1, selId, payMode, splitData);
+    onClose();
+  };
+
+  const canConfirm = payMode !== "split" || totalPaid > 0;
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={e=>e.stopPropagation()}>
         <h3>Sell — {item.name}</h3>
-        <p className="modal-sub">₹{item.price} · Stock: <strong>{item.stock}</strong></p>
+        <p className="modal-sub">₹{price} · Stock: <strong>{item.stock}</strong></p>
 
         {/* Device type filter */}
         <div className="sell-device-filter">
@@ -152,15 +164,12 @@ function SellModal({ item, pcs, ps5Sessions, onClose, onSell }) {
 
         <div className="sell-section-label">Assign to Device (optional)</div>
         <div className="pc-selector-grid">
-          {/* None */}
           <button className={`pc-select-btn ${selId===null?"selected":""}`}
             onClick={()=>{setSelId(null);setSelType("pc");}}>
             <span className="pc-sel-icon">🚫</span>
             <span className="pc-sel-name">No Device</span>
             <span className="pc-sel-sub">Walk-in</span>
           </button>
-
-          {/* PCs */}
           {showPCs && activePCs.map(pc=>(
             <button key={`pc-${pc.id}`}
               className={`pc-select-btn ${selId===pc.id&&selType==="pc"?"selected":""}`}
@@ -170,8 +179,6 @@ function SellModal({ item, pcs, ps5Sessions, onClose, onSell }) {
               <span className="pc-sel-sub">{pc.customer_name||pc.status}</span>
             </button>
           ))}
-
-          {/* PS5s */}
           {showPS5s && activePS5s.map(s=>(
             <button key={`ps5-${s.id}`}
               className={`pc-select-btn ps5-sel-btn ${selId===s.id&&selType==="ps5"?"selected":""}`}
@@ -185,32 +192,160 @@ function SellModal({ item, pcs, ps5Sessions, onClose, onSell }) {
 
         {preview && <div className="sell-assigned-badge">✅ {preview}</div>}
 
+        {/* Payment Mode — big collect-style buttons */}
         <div className="sell-section-label" style={{marginTop:12}}>Payment Mode</div>
-        <div className="sell-device-filter">
-          {[["cash","💵 Cash"],["upi","📱 UPI"]].map(([v,l])=>(
-            <button key={v} className={`sell-filter-btn ${payMode===v?"active":""}`}
-              onClick={()=>setPayMode(v)}>{l}</button>
+        <div className="collect-mode-grid">
+          {[["cash","💵","Cash"],["upi","📱","UPI"]].map(([v,icon,lbl])=>(
+            <button key={v} className={`collect-mode-btn ${payMode===v?"active":""}`}
+              onClick={()=>setPayMode(v)}>
+              <span className="collect-mode-icon">{icon}</span>
+              <span className="collect-mode-label">{lbl}</span>
+            </button>
           ))}
-          {/* Show "Charge to Session" only when a device is selected */}
           {selId !== null && (
-            <button
-              className={`sell-filter-btn sell-filter-charge ${payMode==="charge"?"active":""}`}
+            <button className={`collect-mode-btn collect-mode-charge ${payMode==="charge"?"active":""}`}
               onClick={()=>setPayMode("charge")}>
-              📋 Charge to Session
+              <span className="collect-mode-icon">📋</span>
+              <span className="collect-mode-label">Charge</span>
+            </button>
+          )}
+          {selId !== null && (
+            <button className={`collect-mode-btn collect-mode-split ${payMode==="split"?"active":""}`}
+              onClick={()=>{setPayMode("split");setCashAmt("");setUpiAmt("");}}>
+              <span className="collect-mode-icon">⚡</span>
+              <span className="collect-mode-label">Split</span>
             </button>
           )}
         </div>
 
         {payMode === "charge" && selId !== null && (
           <div className="sell-charge-hint">
-            ₹{item.price * 1} will be added to the pending due for <strong>{preview}</strong>
+            ₹{price} will be added to the pending due for <strong>{preview}</strong>
           </div>
         )}
 
-        <div className="form-actions" style={{ marginTop:16 }}>
-          <button className="btn btn-sell-confirm" onClick={handleSell}>
-            {payMode==="upi" ? "📱" : payMode==="charge" ? "📋" : "💵"}
-            {" "}{payMode==="charge" ? `Charge ₹${item.price} to Due` : `Sell ₹${item.price}`}
+        {payMode === "split" && (
+          <div className="modal-section" style={{marginTop:10}}>
+            <div className="split-inputs-row">
+              <div className="split-input-block">
+                <label>💵 Cash</label>
+                <input className="input-name" type="number" min="0" max={price}
+                  placeholder="₹0" value={cashAmt}
+                  onChange={e=>setCashAmt(e.target.value)} autoFocus />
+              </div>
+              <div className="split-input-block">
+                <label>📱 UPI</label>
+                <input className="input-name" type="number" min="0" max={price}
+                  placeholder="₹0" value={upiAmt}
+                  onChange={e=>setUpiAmt(e.target.value)} />
+              </div>
+            </div>
+            <div className="split-status-row">
+              <span>Total: <strong style={{color:"var(--green)"}}>₹{totalPaid}</strong></span>
+              {dueAmt > 0 && selId !== null && (
+                <span style={{color:"var(--red,#f87171)"}}>
+                  Still due: ₹{dueAmt.toFixed(2)} → charged to session
+                </span>
+              )}
+              {dueAmt > 0 && selId === null && (
+                <span style={{color:"#f59e0b"}}>⚠ No device — full amount must be paid</span>
+              )}
+              {overpaid && <span style={{color:"var(--yellow,#fbbf24)"}}>⚠ Overpaid ₹{(totalPaid-price).toFixed(2)}</span>}
+            </div>
+          </div>
+        )}
+
+        <div className="form-actions" style={{marginTop:16}}>
+          <button className="btn btn-sell-confirm" onClick={handleSell} disabled={!canConfirm}>
+            {payMode==="upi"?"📱":payMode==="charge"?"📋":payMode==="split"?"⚡":"💵"}
+            {" "}{payMode==="charge"
+              ? `Charge ₹${price} to Due`
+              : payMode==="split"
+                ? dueAmt > 0 && selId !== null
+                  ? `Pay ₹${totalPaid} + Charge ₹${dueAmt.toFixed(2)} to Due`
+                  : `Collect ₹${price}`
+                : `Sell ₹${price}`}
+          </button>
+          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Add Item Modal ────────────────────────────────────────────────────────────
+const CATEGORY_OPTIONS = ["chips","drink","energy","chocolate","snack","other"];
+const EMOJI_OPTIONS    = ["🍟","🥤","⚡","🍫","🍿","🧃","🍪","🌮","🥪","🧆","🍱","🍩"];
+
+function AddItemModal({ onClose, onAdd }) {
+  const [form,   setForm]   = useState({ name:"", price:"", category:"snack", emoji:"🍿", stock:"0" });
+  const [saving, setSaving] = useState(false);
+  const set = (k,v) => setForm(f=>({...f,[k]:v}));
+
+  const handleAdd = async () => {
+    if (!form.name.trim())        return toast?.error?.("Name required") || alert("Name required");
+    if (!form.price || Number(form.price) <= 0) return toast?.error?.("Valid price required") || alert("Price required");
+    setSaving(true);
+    try {
+      await onAdd({ name: form.name.trim(), price: Number(form.price), category: form.category, emoji: form.emoji, stock: Number(form.stock)||0 });
+      onClose();
+    } catch(e) { console.error(e); }
+    setSaving(false);
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:400}}>
+        <h3>➕ Add New Item</h3>
+
+        <div className="modal-section">
+          <label className="settings-label">Item Name *</label>
+          <input className="input-name" placeholder="e.g. Lays Magic Masala"
+            value={form.name} onChange={e=>set("name",e.target.value)} autoFocus />
+        </div>
+
+        <div className="modal-section" style={{display:"flex",gap:10}}>
+          <div style={{flex:1}}>
+            <label className="settings-label">Price (₹) *</label>
+            <input className="input-name" type="number" min="1" placeholder="₹0"
+              value={form.price} onChange={e=>set("price",e.target.value)} />
+          </div>
+          <div style={{flex:1}}>
+            <label className="settings-label">Initial Stock</label>
+            <input className="input-name" type="number" min="0" placeholder="0"
+              value={form.stock} onChange={e=>set("stock",e.target.value)} />
+          </div>
+        </div>
+
+        <div className="modal-section">
+          <label className="settings-label">Category</label>
+          <div className="category-pills" style={{marginTop:6}}>
+            {CATEGORY_OPTIONS.map(cat=>(
+              <button key={cat} className={`category-pill ${form.category===cat?"active":""}`}
+                onClick={()=>set("category",cat)}>
+                {cat.charAt(0).toUpperCase()+cat.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="modal-section">
+          <label className="settings-label">Emoji Icon</label>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6}}>
+            {EMOJI_OPTIONS.map(e=>(
+              <button key={e}
+                className={`btn btn-duration ${form.emoji===e?"selected":""}`}
+                style={{fontSize:20,padding:"6px 10px",background:form.emoji===e?"rgba(99,102,241,.3)":"rgba(255,255,255,.05)"}}
+                onClick={()=>set("emoji",e)}>{e}</button>
+            ))}
+          </div>
+          <input className="input-name" style={{marginTop:8}} placeholder="or type any emoji"
+            value={form.emoji} onChange={e=>set("emoji",e.target.value)} maxLength={4} />
+        </div>
+
+        <div className="form-actions" style={{marginTop:16}}>
+          <button className="btn btn-start" onClick={handleAdd} disabled={saving} style={{flex:1}}>
+            {saving?"Adding…":"✅ Add Item"}
           </button>
           <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
         </div>
@@ -244,12 +379,119 @@ function ReturnModal({ sale, onClose, onConfirm }) {
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
-export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessions=[], onSell, onRestock }) {
+// ── Item Delete Button ────────────────────────────────────────────────────────
+function ItemDeleteBtn({ itemId, name, onDelete }) {
+  const [confirm, setConfirm] = useState(false);
+  const [busy,    setBusy]    = useState(false);
+  if (!onDelete) return null;
+  const go = async () => {
+    setBusy(true);
+    try { await onDelete(itemId); } catch(e) { setBusy(false); }
+  };
+  if (confirm) return (
+    <div className="item-del-confirm" onClick={e=>e.stopPropagation()}>
+      <span style={{fontSize:10,color:"#fca5a5"}}>Delete {name}?</span>
+      <button className="btn-tx-delete-confirm" disabled={busy} onClick={go}>{busy?"…":"✓"}</button>
+      <button className="btn-tx-delete-cancel" onClick={()=>setConfirm(false)}>✕</button>
+    </div>
+  );
+  return (
+    <button className="btn btn-item-delete" title="Delete item" onClick={()=>setConfirm(true)}>🗑</button>
+  );
+}
+
+function ResetStockModal({ itemCount, onClose, onConfirm }) {
+  const [qty, setQty] = useState("0");
+  const presets = [0, 5, 10, 20, 50];
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:380}}>
+        <h3>🔄 Reset All Stock</h3>
+        <p className="modal-sub" style={{marginBottom:14}}>
+          Set stock for all <strong>{itemCount}</strong> items to the same value.
+        </p>
+
+        <div className="modal-section">
+          <label className="settings-label">Set stock to</label>
+          <div style={{display:"flex",gap:6,marginTop:6,flexWrap:"wrap"}}>
+            {presets.map(v=>(
+              <button key={v}
+                className={`btn btn-duration ${Number(qty)===v?"selected":""}`}
+                style={{minWidth:44}}
+                onClick={()=>setQty(String(v))}>
+                {v}
+              </button>
+            ))}
+            <input
+              className="input-name"
+              type="number" min="0"
+              style={{width:80}}
+              value={qty}
+              onChange={e=>setQty(e.target.value)}
+              placeholder="Custom"
+            />
+          </div>
+        </div>
+
+        <div className="form-actions" style={{marginTop:16}}>
+          <button
+            className="btn btn-reset-stock-confirm"
+            onClick={()=>onConfirm(Number(qty)||0)}
+            style={{flex:1}}>
+            ✅ Set all to {qty||0}
+          </button>
+          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Inline Price Editor ───────────────────────────────────────────────────────
+function InlinePrice({ item, onReprice }) {
+  const [editing, setEditing] = useState(false);
+  const [val,     setVal]     = useState(String(item.price));
+  const inputRef              = useRef(null);
+
+  const startEdit = () => { setVal(String(item.price)); setEditing(true); };
+  const commit    = () => {
+    const n = Number(val);
+    if (!isNaN(n) && n > 0 && n !== item.price) onReprice(item.id, n);
+    setEditing(false);
+  };
+  const cancel = () => setEditing(false);
+
+  useEffect(() => { if (editing && inputRef.current) inputRef.current.select(); }, [editing]);
+
+  if (editing) return (
+    <span className="item-price-edit">
+      <span className="item-price-rupee">₹</span>
+      <input
+        ref={inputRef}
+        className="price-inline-input"
+        type="number" min="1"
+        value={val}
+        onChange={e=>setVal(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e=>{ if(e.key==="Enter") commit(); if(e.key==="Escape") cancel(); }}
+      />
+    </span>
+  );
+  return (
+    <span className="item-price item-price-clickable" onClick={startEdit} title="Click to edit price">
+      ₹{item.price} <span className="price-edit-icon">✎</span>
+    </span>
+  );
+}
+
+export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessions=[], onSell, onRestock, onAddItem, onReprice, onResetStock, onDeleteItem }) {
   const [category,    setCategory]    = useState("all");
   const [search,      setSearch]      = useState("");
   const [restockItem, setRestockItem] = useState(null);
   const [sellItem,    setSellItem]    = useState(null);
   const [returnSale,  setReturnSale]  = useState(null);
+  const [addingItem,  setAddingItem]  = useState(false);
+  const [resetConfirm, setResetConfirm] = useState(false);
   const [viewTab,     setViewTab]     = useState("all");
   const [salesDate,   setSalesDate]   = useState("");
   const [returning,   setReturning]   = useState(false);
@@ -312,6 +554,15 @@ export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessi
       {sellItem    && <SellModal item={sellItem} pcs={pcs} ps5Sessions={ps5Sessions}
                         onClose={()=>setSellItem(null)} onSell={onSell} />}
       {returnSale  && <ReturnModal sale={returnSale} onClose={()=>setReturnSale(null)} onConfirm={handleReturn} />}
+      {addingItem  && <AddItemModal onClose={()=>setAddingItem(false)} onAdd={onAddItem} />}
+
+      {resetConfirm && (
+        <ResetStockModal
+          itemCount={items.length}
+          onClose={()=>setResetConfirm(false)}
+          onConfirm={v=>{ onResetStock(v); setResetConfirm(false); }}
+        />
+      )}
 
       <div className="canteen-layout">
         {/* ── Left: Items ── */}
@@ -328,6 +579,8 @@ export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessi
                 </button>
               ))}
             </div>
+            <button className="btn btn-add-item" onClick={()=>setAddingItem(true)}>➕ Add Item</button>
+            <button className="btn btn-reset-stock" onClick={()=>setResetConfirm(true)}>🔄 Reset Stock</button>
           </div>
 
           <div className="items-grid">
@@ -342,7 +595,7 @@ export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessi
                   <div className="item-name">{item.name}</div>
                   <div className="item-category">{item.category}</div>
                   <div className="item-meta">
-                    <span className="item-price">₹{item.price}</span>
+                    <InlinePrice item={item} onReprice={onReprice} />
                     <span className={`item-stock ${item.stock<=5?"stock-low":""}`}>
                       {item.stock===0?"Out of stock":`${item.stock} left`}
                     </span>
@@ -352,6 +605,7 @@ export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessi
                   <button className="btn btn-sell" disabled={item.stock===0}
                     onClick={()=>setSellItem(item)}>Sell</button>
                   <button className="btn btn-restock-sm" onClick={()=>setRestockItem(item)}>+Stock</button>
+                  <ItemDeleteBtn itemId={item.id} name={item.name} onDelete={onDeleteItem} />
                 </div>
               </div>
             ))}
@@ -440,6 +694,11 @@ export default function CanteenManagement({ items=[], sales=[], pcs=[], ps5Sessi
                   {viewTab==="all"&&s.pc_name&&(
                     <span className="sale-pc-tag">
                       {s.ps5_id?"🎮":"🖥"} {s.pc_name}{s.customer_name?` · ${s.customer_name}`:""}
+                    </span>
+                  )}
+                  {s.payment_mode==="split"&&(
+                    <span className="sale-pc-tag" style={{color:"#fbbf24",borderColor:"rgba(245,158,11,.3)"}}>
+                      ✂️ Split {s.split_amount_paid!=null?`₹${s.split_amount_paid} paid`:""}
                     </span>
                   )}
                   {s.returned&&<span className="returned-badge">↩ Returned</span>}

@@ -13,6 +13,7 @@ import GameBackground    from "./components/GameBackground";
 import { initFirebase }  from "./firebaseInit";
 import {
   listenPCs, listenCanteen, listenSales, listenSessionHistory,
+  listenServerTimeOffset,
   listenPayments, listenSettings, listenPendingDues, listenMetreReadings,
   listenWithdrawals, listenConsoles, listenPS5Sessions,
   // PC
@@ -81,6 +82,7 @@ export default function App() {
       toast.error("Firebase connection failed");
     });
     const u = [
+      listenServerTimeOffset(),
       listenPCs(setPcs), listenPS5Sessions(setPs5Sessions),
       listenCanteen(setCanteenItems), listenSales(setSales),
       listenSessionHistory(setHistory), listenPayments(setPayments),

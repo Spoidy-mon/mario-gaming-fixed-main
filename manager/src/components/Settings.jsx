@@ -18,13 +18,15 @@ const DEFAULT_SETTINGS = {
   cafeeUpiId: "",
   cafeeUpiName: "",
   pricing: { 30: 15, 60: 30, 90: 45, 120: 60 },
-  ps5Pricing: { 30: 60, 60: 120, 90: 180, 120: 240 },
+  ps5Pricing: { 15: 25, 30: 50, 60: 100, 90: 150, 120: 200 },
   extraTimePricing: { 15: 25, 30: 50, 60: 100 },
   ps5ExtraTimePricing: { 15: 40, 30: 80, 60: 160 },
   freeOption1: 5,
   freeOption2: 10,
   electricityRate: 8,
   adminPassword: "1234",
+  partners: ["Rajeev", "Kunal", "Vikrant", "Partner 4"],
+  cafeSharePct: 30,  // % of monthly revenue that goes to Mario Cafe before partner split
 };
 
 function Section({ icon, title, subtitle, children, accent, danger }) {
@@ -170,18 +172,30 @@ function PricingCard({ color, durations, extraOptions, rpmLabel }) {
 
 function DeviceEditModal({ device, type, onSave, onClose }) {
   const isPC = type === "pc";
-  const [name, setName] = useState(device.name || "");
-  const [notes, setNotes] = useState(device.notes || "");
-  const [specs, setSpecs] = useState(device.specs || "");
-  const [seat, setSeat] = useState(device.seat || "");
-  const [hdmi, setHdmi] = useState(device.hdmi || "");
-  const [busy, setBusy] = useState(false);
+  const [name,       setName]       = useState(device.name || "");
+  const [notes,      setNotes]      = useState(device.notes || "");
+  const [specs,      setSpecs]      = useState(device.specs || "");
+  const [seat,       setSeat]       = useState(device.seat || "");
+  const [hdmi,       setHdmi]       = useState(device.hdmi || "");
+  const [busy,       setBusy]       = useState(false);
+
+  // Per-PC custom pricing (optional — overrides global pricing if set)
+  const dp = device.pricing || {};
+  const [p30,  setP30]  = useState(dp[30]  != null ? String(dp[30])  : "");
+  const [p60,  setP60]  = useState(dp[60]  != null ? String(dp[60])  : "");
+  const [p90,  setP90]  = useState(dp[90]  != null ? String(dp[90])  : "");
+  const [p120, setP120] = useState(dp[120] != null ? String(dp[120]) : "");
 
   const handle = async () => {
     if (!name.trim()) return toast.error("Name is required");
     setBusy(true);
     try {
-      await onSave({ name, notes, specs, seat, hdmi });
+      const pricing = {};
+      if (p30  !== "") pricing[30]  = Number(p30);
+      if (p60  !== "") pricing[60]  = Number(p60);
+      if (p90  !== "") pricing[90]  = Number(p90);
+      if (p120 !== "") pricing[120] = Number(p120);
+      await onSave({ name, notes, specs, seat, hdmi, pricing: Object.keys(pricing).length ? pricing : null });
       toast.success(`✅ ${device.name} updated`);
       onClose();
     } catch (e) {
@@ -247,7 +261,8 @@ function DeviceEditModal({ device, type, onSave, onClose }) {
                 </div>
               )}
             </div>
-            <div style={{ marginTop: 8 }}>
+
+          <div style={{ marginTop: 8 }}>
               <label className="settings-label">Notes</label>
               <input
                 className="input-name"
@@ -257,6 +272,25 @@ function DeviceEditModal({ device, type, onSave, onClose }) {
               />
             </div>
           </div>
+
+          {isPC && (
+            <div className="modal-section">
+              <div className="modal-section-title">💰 Custom Pricing <span style={{fontWeight:400,color:"var(--text-muted)",fontSize:11}}>(leave blank for global rates)</span></div>
+              <div className="pricing-grid">
+                {[["30 min", p30, setP30], ["1 hour", p60, setP60], ["1.5 hrs", p90, setP90], ["2 hrs", p120, setP120]].map(([lbl, val, setter]) => (
+                  <div key={lbl} className="pricing-input-block">
+                    <label className="settings-label">{lbl}</label>
+                    <div className="pricing-input-wrap">
+                      <span className="pricing-rupee">₹</span>
+                      <input className="input-name pricing-input" type="number" min="0"
+                        placeholder="—" value={val}
+                        onChange={e => setter(e.target.value)} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="form-actions">
             <button className="btn btn-start" style={{ flex: 2 }} onClick={handle} disabled={busy}>
@@ -325,6 +359,7 @@ function DeviceCard({ device, type, onEdit, onDelete, onToggleOnline }) {
         {device.seat && <span className="dv-meta-chip">📍 {device.seat}</span>}
         {isPC && device.specs && <span className="dv-meta-chip">💻 {device.specs}</span>}
         {!isPC && device.hdmi && <span className="dv-meta-chip">📺 {device.hdmi}</span>}
+        {!isPC && device.max_players && <span className="dv-meta-chip">👥 {device.max_players}P</span>}
         {device.notes && <span className="dv-meta-chip">📝 {device.notes}</span>}
       </div>
 
@@ -354,11 +389,11 @@ function DeviceCard({ device, type, onEdit, onDelete, onToggleOnline }) {
 
 function AddDeviceModal({ type, existingIds, onClose, onAdded }) {
   const isPC = type === "pc";
-  const [id, setId] = useState("");
-  const [name, setName] = useState("");
-  const [seat, setSeat] = useState("");
-  const [specs, setSpecs] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [id,         setId]         = useState("");
+  const [name,       setName]       = useState("");
+  const [seat,       setSeat]       = useState("");
+  const [specs,      setSpecs]      = useState("");
+  const [busy,       setBusy]       = useState(false);
 
   const suggestName = (rawId) => {
     const n = Number(rawId);
@@ -463,7 +498,7 @@ function AddDeviceModal({ type, existingIds, onClose, onAdded }) {
                   />
                 </div>
               )}
-            </div>
+              </div>
           </div>
 
           <div className="form-actions">
@@ -1027,6 +1062,7 @@ export default function Settings({ settings, onSave, pcs = [], ps5Sessions = [] 
                 <PricingCard
                   color="#8b5cf6"
                   durations={[
+                    { dur: 15, value: form.ps5Pricing?.[15] || 0, onChange: (v) => setPS5P(15, v) },
                     { dur: 30, value: form.ps5Pricing?.[30] || 0, onChange: (v) => setPS5P(30, v) },
                     { dur: 60, value: form.ps5Pricing?.[60] || 0, onChange: (v) => setPS5P(60, v) },
                     { dur: 90, value: form.ps5Pricing?.[90] || 0, onChange: (v) => setPS5P(90, v) },
@@ -1105,6 +1141,30 @@ export default function Settings({ settings, onSave, pcs = [], ps5Sessions = [] 
                   type="password"
                 />
               </Field>
+            </Section>
+
+            <Section icon="🤝" title="Partners" subtitle="Equal share of total assets — names editable">
+              <Field label="Mario Cafe Share (%)">
+                <TxtIn
+                  value={String(form.cafeSharePct ?? 30)}
+                  onChange={(v) => set("cafeSharePct", Number(v) || 0)}
+                  placeholder="30"
+                  type="number"
+                />
+              </Field>
+              {(form.partners || DEFAULT_SETTINGS.partners).map((name, i) => (
+                <Field key={i} label={`Partner ${i + 1}`}>
+                  <TxtIn
+                    value={name}
+                    onChange={(v) => {
+                      const updated = [...(form.partners || DEFAULT_SETTINGS.partners)];
+                      updated[i] = v;
+                      set("partners", updated);
+                    }}
+                    placeholder={`Partner ${i + 1}`}
+                  />
+                </Field>
+              ))}
             </Section>
           </div>
         )}

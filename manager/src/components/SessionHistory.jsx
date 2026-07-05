@@ -39,7 +39,25 @@ function StatCard({ label, value, sub, color }) {
   );
 }
 
-export default function SessionHistory({ history = [], sales = [], pcs = [] }) {
+function HistDeleteBtn({ sessionKey, onDelete }) {
+  const [confirm, setConfirm] = React.useState(false);
+  const [busy,    setBusy]    = React.useState(false);
+  if (!onDelete) return null;
+  const go = async (e) => {
+    e.stopPropagation();
+    setBusy(true);
+    try { await onDelete(sessionKey); } catch(err) { setBusy(false); }
+  };
+  if (confirm) return (
+    <span style={{display:"flex",gap:3}} onClick={e=>e.stopPropagation()}>
+      <button className="btn-tx-delete-confirm" disabled={busy} onClick={go}>{busy?"…":"✓"}</button>
+      <button className="btn-tx-delete-cancel" onClick={e=>{e.stopPropagation();setConfirm(false);}}>✕</button>
+    </span>
+  );
+  return <button className="btn-tx-delete hist-del-btn" title="Delete session" onClick={e=>{e.stopPropagation();setConfirm(true);}}>🗑</button>;
+}
+
+export default function SessionHistory({ history = [], sales = [], pcs = [], onDeleteHistory }) {
   const [filterPC,       setFilterPC]       = useState("all");
   const [filterCustomer, setFilterCustomer] = useState("");
   const [filterDate,     setFilterDate]     = useState("all");
@@ -289,12 +307,15 @@ export default function SessionHistory({ history = [], sales = [], pcs = [] }) {
                           {isExpanded ? "▲" : "▼"}
                         </button>
                       </td>
+                      <td onClick={e=>e.stopPropagation()}>
+                        <HistDeleteBtn sessionKey={session.key} onDelete={onDeleteHistory} />
+                      </td>
                     </tr>
 
                     {/* Expanded row — canteen purchases */}
                     {isExpanded && (
                       <tr className="hist-detail-row">
-                        <td colSpan={10}>
+                        <td colSpan={11}>
                           <div className="hist-detail-box">
                             <div className="hist-detail-grid">
                               {/* Session info */}

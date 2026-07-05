@@ -452,8 +452,6 @@ function SessionCard({ dev, devType, settings, onStart, onQuickStart, onAddTime,
   const [modal,      setModal]      = useState(null);
   const [localTime,  setLocalTime]  = useState(dev.time_remaining);
   const [confirmShut,setConfirmShut]= useState(false);
-  const localTimeRef   = React.useRef(dev.time_remaining);
-  const intervalRef    = React.useRef(null);
 
   const statusCls = getStatusCls(dev);
   const isPS5     = devType === "ps5";
@@ -462,59 +460,35 @@ function SessionCard({ dev, devType, settings, onStart, onQuickStart, onAddTime,
   const icon      = isPS5 ? "🎮" : "🖥";
   const color     = isPS5 ? "ps5-card" : "";
 
-  // Sync from Firebase: use server-anchored end time when available for accuracy
-  // Only hard-reset local counter when an external change (add/reduce) happens (diff > 8s)
-  useEffect(() => {
-    if (dev.status !== "active") {
-      // Not active — always sync to FB value (0 or whatever)
-      localTimeRef.current = dev.time_remaining;
-      setLocalTime(dev.time_remaining);
-      return;
-    }
-    // Use server-anchored end time for precise sync
-    if (dev.session_end_time && dev.session_end_time > Date.now()) {
-      const serverTime = Math.max(0, Math.round((dev.session_end_time - Date.now()) / 1000));
-      const diff = Math.abs(localTimeRef.current - serverTime);
-      // Only snap to server time on significant external change (add/reduce)
-      if (diff > 8) {
-        localTimeRef.current = serverTime;
-        setLocalTime(serverTime);
-      }
-    } else {
-      const diff = Math.abs(localTimeRef.current - dev.time_remaining);
-      if (diff > 8) {
-        localTimeRef.current = dev.time_remaining;
-        setLocalTime(dev.time_remaining);
-      }
-    }
-  }, [dev.time_remaining, dev.session_end_time, dev.status]);
+  // Pure epoch-based timer — visibilitychange snaps on tab focus (fixes Chrome throttle)
+  const endTimeRef   = React.useRef(dev.session_end_time || 0);
+  const intervalRef  = React.useRef(null);
 
-  // Single stable countdown interval — created once per active session, never duplicated
+  function calcFromEpoch() {
+    const et = endTimeRef.current;
+    if (et > Date.now()) return Math.max(0, Math.round((et - Date.now()) / 1000));
+    return Math.max(0, dev.time_remaining || 0);
+  }
+
   useEffect(() => {
-    // Clear any existing interval first to prevent duplication
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
+    if (dev.session_end_time) endTimeRef.current = dev.session_end_time;
+    setLocalTime(calcFromEpoch());
+  }, [dev.session_end_time, dev.time_remaining, dev.status]); // eslint-disable-line
+
+  useEffect(() => {
+    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
     if (dev.status !== "active" || dev.is_paused) return;
 
-    intervalRef.current = setInterval(() => {
-      // Prefer server-anchored calculation to prevent drift
-      let next;
-      if (dev.session_end_time && dev.session_end_time > Date.now()) {
-        next = Math.max(0, Math.round((dev.session_end_time - Date.now()) / 1000));
-      } else {
-        next = Math.max(0, localTimeRef.current - 1);
-      }
-      localTimeRef.current = next;
-      setLocalTime(next);
-    }, 1000);
+    intervalRef.current = setInterval(() => setLocalTime(calcFromEpoch()), 500);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") setLocalTime(calcFromEpoch());
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [dev.status, dev.is_paused, dev.session_end_time]); // eslint-disable-line
 
